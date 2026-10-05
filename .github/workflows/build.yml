@@ -1,0 +1,32 @@
+name: Build unsigned iPhone probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          brew install xcodegen
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable aarch64-apple-ios
+      - name: Build Rust core
+        working-directory: core
+        run: cargo +stable build --release --target aarch64-apple-ios
+      - name: Build iPhone application
+        run: |
+          xcodegen generate
+          xcodebuild -project PhoneRunnerProbe.xcodeproj -scheme PhoneRunnerProbe -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+          mkdir -p package/Payload
+          cp -R build/Build/Products/Release-iphoneos/PhoneRunnerProbe.app package/Payload/
+          cd package
+          zip -qr ../PhoneRunnerProbe-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhoneRunnerProbe-unsigned
+          path: PhoneRunnerProbe-unsigned.ipa
+          retention-days: 7
