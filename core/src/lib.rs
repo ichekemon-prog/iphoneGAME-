@@ -1,5 +1,5 @@
 use std::{ffi::{c_char, CStr, CString}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
-use idevice::{IdeviceService, pairing_file::PairingFile, provider::{IdeviceProvider, TcpProvider}, services::{installation_proxy::InstallationProxyClient, wda::WdaClient, dvt::xctest::{TestConfig, XCUITestService}}};
+use idevice::{IdeviceService, pairing_file::PairingFile, provider::{IdeviceProvider, TcpProvider}, services::{lockdown::LockdownClient, installation_proxy::InstallationProxyClient, wda::WdaClient, dvt::xctest::{TestConfig, XCUITestService}}};
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -18,9 +18,30 @@ async fn probe(path: String, host: String, bundle: String) -> Result<(), &'stati
     let provider: Arc<dyn IdeviceProvider> = Arc::new(TcpProvider {
         addr, scope_id: None, pairing_file: pairing, label: "PhoneRunnerProbe".into()
     });
-    status("2/4: ペアリング認証・インストール済みRunnerを確認中");
-    let mut proxy = InstallationProxyClient::connect(provider.as_ref()).await
-        .map_err(|_| "認証またはアプリ情報の取得に失敗。ペアリング経路の検証が必要です")?;
+    status("診断版2・2A: Lockdownへ接続中");
+    let mut lockdown = tokio::time::timeout(Duration::from_secs(10), LockdownClient::connect(provider.as_ref())).await
+        .map_err(|_| "2A: Lockdown接続タイムアウト")?
+        .map_err(|_| "2A: Lockdown接続失敗")?;
+    status("診断版2・2B: ペアリング認証とTLS接続中");
+    let pairing = provider.get_pairing_file().await.map_err(|_| "2B: 保存済み認証情報の取得失敗")?;
+    let legacy = tokio::time::timeout(Duration::from_secs(15), lockdown.start_session(&pairing)).await
+        .map_err(|_| "2B: ペアリング認証/TLSタイムアウト")?
+        .map_err(|_| "2B: ペアリング認証/TLS失敗（USB認証とは別経路）")?;
+    status("診断版2・2C: アプリ情報サービスを起動中");
+    let (port, ssl) = tokio::time::timeout(Duration::from_secs(10), lockdown.start_service(InstallationProxyClient::service_name())).await
+        .map_err(|_| "2C: サービス起動タイムアウト")?
+        .map_err(|_| "2C: アプリ情報サービスの起動を拒否されました")?;
+    status("診断版2・2D: アプリ情報サービスへ接続中");
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), provider.connect(port)).await
+        .map_err(|_| "2D: サービスポート接続タイムアウト（VPN経路を確認）")?
+        .map_err(|_| "2D: サービスポート接続失敗（VPN経路を確認）")?;
+    if ssl {
+        tokio::time::timeout(Duration::from_secs(15), stream.start_session(&pairing, legacy)).await
+            .map_err(|_| "2E: サービスTLSタイムアウト")?
+            .map_err(|_| "2E: サービスTLS認証失敗")?;
+    }
+    let mut proxy = InstallationProxyClient::new(stream);
+    status("診断版2・2F: Runner情報を照会中");
     let cfg = TestConfig::from_installation_proxy(&mut proxy, &bundle, None).await
         .map_err(|_| "Runner情報を取得できません。署名後のBundle IDを確認してください")?;
     drop(proxy);
