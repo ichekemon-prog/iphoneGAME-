@@ -1,0 +1,12 @@
+[package]
+name = "phone_runner_probe"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+idevice = { git = "https://github.com/jkcoxson/idevice", rev = "d32c8189c51c2789496b0768039419c3705498c3", default-features = false, features = ["ring", "tcp", "xctest", "wda"] }
+tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"] }
+

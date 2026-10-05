@@ -1,0 +1,25 @@
+name: PhoneRunnerProbe
+options:
+  deploymentTarget:
+    iOS: '17.4'
+targets:
+  PhoneRunnerProbe:
+    type: application
+    platform: iOS
+    sources: [App]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.local.PhoneRunnerProbe
+        SWIFT_VERSION: '5.0'
+        SWIFT_OBJC_BRIDGING_HEADER: App/Bridge.h
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: '1'
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: 自分のiPhoneの開発用サービスへの接続検証に使います。
+        LIBRARY_SEARCH_PATHS: '$(inherited) $(SRCROOT)/core/target/aarch64-apple-ios/release'
+        OTHER_LDFLAGS: '$(inherited) -lphone_runner_probe -framework Security -framework SystemConfiguration -liconv -lresolv'
+schemes:
+  PhoneRunnerProbe:
+    build:
+      targets:
+        PhoneRunnerProbe: all
