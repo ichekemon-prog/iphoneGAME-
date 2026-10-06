@@ -66,6 +66,8 @@ struct ProbeView: View {
     @State private var keyInput = ""
     @State private var hasKey = KeyStore.load() != nil
     @State private var importing = false
+    @State private var editingInstruction = false
+    @FocusState private var instructionFocused: Bool
     @State private var status = "診断版8: AIエージェント"
     @State private var running = false
     @State private var connectionReport = ConnectionReport.empty
@@ -89,7 +91,15 @@ struct ProbeView: View {
                 }
                 Section("指示") {
                     TextField("例: 今いる画面から、イベントのステージを1回クリアして", text: $instruction, axis: .vertical)
-                        .lineLimit(2...6)
+                        .lineLimit(8...)
+                        .focused($instructionFocused)
+                        .disabled(agent.active)
+                    Button("全画面で編集") {
+                        instructionFocused = false
+                        editingInstruction = true
+                    }.disabled(agent.active)
+                    Text("\(instruction.count)文字 · 自動保存")
+                        .font(.caption).foregroundStyle(.secondary)
                     Toggle("実行する（OFF=観察のみ・操作しない）", isOn: $execute)
                     Stepper("最大 \(maxSteps) 手", value: $maxSteps, in: 1...200)
                     Stepper("AIに聞く間隔 \(Int(interval)) 秒以上", value: $interval, in: 2...60, step: 1)
@@ -136,7 +146,20 @@ struct ProbeView: View {
                     Button("認証ファイルを読み込む") { importing = true }
                     Text(hasPairing ? "Remote Pairing情報を確認済み（端末内のみ）" : "Remote Pairing情報が未設定、または形式が不正です")
                 }.disabled(running || agent.active)
-            }.navigationTitle("Phone Runner Probe")
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .navigationTitle("Phone Runner Probe")
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    if instructionFocused {
+                        Spacer()
+                        Button("キーボードを閉じる") { instructionFocused = false }
+                    }
+                }
+            }
+        }
+        .fullScreenCover(isPresented: $editingInstruction) {
+            InstructionEditor(instruction: $instruction)
         }
         .onAppear { refreshPairing(); agent.probeInFront = true }
         .onReceive(timer) { _ in
@@ -235,6 +258,39 @@ struct ProbeView: View {
         if backgroundTask != .invalid {
             UIApplication.shared.endBackgroundTask(backgroundTask)
             backgroundTask = .invalid
+        }
+    }
+}
+
+private struct InstructionEditor: View {
+    @Binding var instruction: String
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("指示は自動保存されます。長文はスクロールして編集できます。")
+                    .font(.caption).foregroundStyle(.secondary)
+                TextEditor(text: $instruction)
+                    .font(.body)
+                    .focused($focused)
+                    .scrollDismissesKeyboard(.interactively)
+                    .accessibilityLabel("エージェントへの指示")
+                Text("\(instruction.count)文字").font(.caption).foregroundStyle(.secondary)
+            }
+            .padding()
+            .navigationTitle("指示を編集")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完了") { focused = false; dismiss() }
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("キーボードを閉じる") { focused = false }
+                }
+            }
         }
     }
 }
