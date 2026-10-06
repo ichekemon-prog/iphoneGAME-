@@ -12,7 +12,9 @@ struct ProbeView: View {
     @AppStorage("targetIP") private var host = "10.7.0.1"
     @AppStorage("runnerBundle") private var bundle = ""
     @State private var importing = false
-    @State private var status = "診断版3: Remote Pairing接続試験"
+    @State private var status = "診断版4: 携帯通信復帰後の接続維持試験"
+    @State private var holding = false
+    @State private var markedRestored = false
     @State private var running = false
     @State private var hasPairing = false
     @State private var lifecycle = "前面で待機中"
@@ -25,9 +27,9 @@ struct ProbeView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("診断版3・接続のみの試験") {
-                    Text("保存済みのRemote Pairing情報で接続し、利用可能なサービスを確認します。外部のloopback VPNが必要です。")
-                    Text("試験中はこの画面を開いたままにしてください。WDA起動・タップ・ゲーム周回は行いません。")
+                Section("診断版4・接続維持の試験") {
+                    Text("LocalDevVPN接続後、機内モードONで開始します。接続成功と表示されたら機内モードをOFFにし、4G/5G表示に戻ったら『携帯通信を戻しました』を押してください。")
+                    Text("同じ接続を約2分保ち、応答を確認します。切り替え後はこの画面を開いたままにしてください。ゲーム通信・WDA操作はまだ検証しません。")
                 }
                 Section("接続設定") {
                     TextField("VPNの接続先IP", text: $host).textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -37,6 +39,10 @@ struct ProbeView: View {
                 Section("試験") {
                     Button("Remote Pairing接続試験を開始") { start() }
                         .disabled(running || !hasPairing)
+                    Button(markedRestored ? "携帯通信の復帰を記録済み" : "携帯通信を戻しました") {
+                        probe_mark_cellular_restored()
+                        markedRestored = true
+                    }.disabled(!running || !holding || markedRestored)
                     Button("停止", role: .destructive) { probe_stop() }.disabled(!running)
                     Text(status).textSelection(.enabled)
                     Text(lifecycle).font(.footnote)
@@ -46,6 +52,7 @@ struct ProbeView: View {
         .onAppear { refreshPairing() }
         .onReceive(timer) { _ in
             running = probe_running()
+            holding = probe_holding()
             if let text = probe_status() {
                 let value = String(cString: text)
                 probe_free_string(text)
@@ -111,6 +118,7 @@ struct ProbeView: View {
             }
         }
         running = ok
+        if ok { markedRestored = false; holding = false }
         if !ok { status = "試験を開始できませんでした" }
     }
     private func endBackgroundTask() {
