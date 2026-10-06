@@ -30,6 +30,7 @@ jobs:
           mkdir -p package/Payload
           cp -R build/Build/Products/Release-iphoneos/PhoneRunnerProbe.app package/Payload/
           cd package
+          /usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes' Payload/PhoneRunnerProbe.app/Info.plist
           zip -qr ../PhoneRunnerProbe-unsigned.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
