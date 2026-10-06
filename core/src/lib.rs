@@ -134,39 +134,106 @@ async fn open_tunnel(path: String, addr: std::net::IpAddr) -> Result<(AdapterHan
     Ok((handle, handshake))
 }
 
+/// Minimal HTTP POST to WDA through the tunnel. Returns (status, body).
+async fn wda_post(provider: &TunnelProvider, path: &str, body: &str) -> Result<(u16, String), IdeviceError> {
+    let mut dev = provider.connect(8100).await?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    dev.send_raw(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    loop {
+        let chunk = match dev.read_any(8192).await {
+            Ok(c) => c,
+            Err(_) if !response.is_empty() => break, // connection closed by WDA
+            Err(e) => return Err(e),
+        };
+        if chunk.is_empty() { break; }
+        response.extend_from_slice(&chunk);
+        let text = String::from_utf8_lossy(&response);
+        if let Some(h) = text.find("\r\n\r\n") {
+            let len = text[..h].lines()
+                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)));
+            if let Some(len) = len && response.len() >= h + 4 + len { break; }
+        }
+    }
+    let text = String::from_utf8_lossy(&response).to_string();
+    let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    Ok((status, body))
+}
+
+/// WDA error name only (e.g. "unknown command"), never the whole body.
+fn wda_error_name(body: &str) -> String {
+    let Some(i) = body.find("\"error\"") else { return "-".into() };
+    let rest = &body[i + 7..];
+    let Some(q1) = rest.find('"') else { return "-".into() };
+    let rest = &rest[q1 + 1..];
+    rest.split('"').next().unwrap_or("-").chars().take(60).collect()
+}
+
+async fn wda_call(provider: &TunnelProvider, label: &str, path: &str, body: &str) -> Result<(), String> {
+    status(label);
+    match tokio::time::timeout(Duration::from_secs(15), wda_post(provider, path, body)).await {
+        Err(_) => Err(format!("{label}: タイムアウト（15秒）")),
+        Ok(Err(e)) => Err(safe_error(label, e)),
+        Ok(Ok((200, _))) => Ok(()),
+        Ok(Ok((code, body))) => Err(format!("{label}: HTTP {code} / {}", wda_error_name(&body))),
+    }
+}
+
 /// W3-W7: runs while the XCTest runner keeps WDA alive.
 async fn drive_wda(handle: AdapterHandle, self_bundle: String) -> Result<String, String> {
     let provider = TunnelProvider { handle };
     let mut wda = WdaClient::new(&provider).with_timeout(Duration::from_secs(8));
     step("W3: WDAの起動待ち（最大60秒）", 65, wda.wait_until_ready(Duration::from_secs(60))).await?;
     let session = step("W4: WDAセッション開始", 20, wda.start_session(None)).await?;
+    let mut notes = Vec::new();
     if !self_bundle.is_empty() {
-        // The runner may have come to the front. Bring this app back.
-        step("W5: Probeを前面に戻す", 20, wda.activate_app(&self_bundle, Some(&session))).await?;
+        // WDA native endpoint (the "mobile:" scripts are Appium-only).
+        let body = format!("{{\"bundleId\":\"{self_bundle}\"}}");
+        match wda_call(&provider, "W5: Probeを前面に戻す", &format!("/session/{session}/wda/apps/activate"), &body).await {
+            Ok(()) => notes.push("W5成功".to_string()),
+            Err(e) => notes.push(format!("{e}（続行）")),
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     let point = TAP_POINT.lock().ok().and_then(|p| *p);
     let Some((x, y)) = point else {
         return Err("W6: タップ目標の位置が未設定です".into());
     };
-    step("W6: WDAで目印をタップ", 20, wda.tap(Some(x), Some(y), None, Some(&session))).await?;
-    status("W7: タップ命令は成功。画面のタップ回数を確認してください（60秒維持）");
+    let actions = format!(
+        "{{\"actions\":[{{\"type\":\"pointer\",\"id\":\"finger1\",\"parameters\":{{\"pointerType\":\"touch\"}},\"actions\":[{{\"type\":\"pointerMove\",\"duration\":0,\"x\":{x:.0},\"y\":{y:.0}}},{{\"type\":\"pointerDown\",\"button\":0}},{{\"type\":\"pause\",\"duration\":100}},{{\"type\":\"pointerUp\",\"button\":0}}]}}]}}"
+    );
+    let tapped = match wda_call(&provider, "W6a: W3C操作でタップ", &format!("/session/{session}/actions"), &actions).await {
+        Ok(()) => "W6a(actions)".to_string(),
+        Err(first) => {
+            let body = format!("{{\"x\":{x:.0},\"y\":{y:.0}}}");
+            wda_call(&provider, "W6b: wda/tapでタップ", &format!("/session/{session}/wda/tap"), &body)
+                .await
+                .map_err(|second| format!("{first}\n{second}"))?;
+            format!("W6b(wda/tap)  ※{first}")
+        }
+    };
+    notes.push(format!("タップ命令成功: {tapped}"));
+    let summary = notes.join("\n");
     // Keep WDA alive for a short while and confirm it still answers.
     let mut ok = 0;
     for _ in 0..12 {
+        status(&format!(
+            "W7: WDA応答 {ok}/12 回\n{summary}\n画面の『WDAからのタップ回数』が1以上なら、iPhone単体でのタップ成功です。"
+        ));
         tokio::time::sleep(Duration::from_secs(5)).await;
         match tokio::time::timeout(Duration::from_secs(8), wda.status()).await {
             Ok(Ok(_)) => ok += 1,
-            Ok(Err(e)) => return Err(safe_error(&format!("W7: WDA応答確認（成功{ok}回の後）"), e)),
-            Err(_) => return Err(format!("W7: WDA応答が8秒以内にありません（成功{ok}回の後）")),
+            Ok(Err(e)) => return Err(format!("{}\n{summary}", safe_error(&format!("W7: WDA応答確認（成功{ok}回の後）"), e))),
+            Err(_) => return Err(format!("W7: WDA応答が8秒以内にありません（成功{ok}回の後）\n{summary}")),
         }
-        status(&format!(
-            "W7: タップ命令は成功。WDA応答 {ok}/12 回\n画面の『WDAからのタップ回数』が1以上なら、iPhone単体でのタップ成功です。"
-        ));
     }
     let _ = wda.delete_session(&session).await;
     Ok(format!(
-        "診断版5: 完了。WDA起動・タップ命令・60秒維持（応答{ok}/12回）\n『WDAからのタップ回数』を確認してください。ゲーム操作・長時間・USB切断後の再現は未検証です。"
+        "診断版5.1: 完了。WDA応答{ok}/12回\n{summary}\n『WDAからのタップ回数』を確認してください。ゲーム操作・長時間・USB切断後は未検証です。"
     ))
 }
 
@@ -220,7 +287,7 @@ pub unsafe extern "C" fn probe_start(
         return false;
     };
     STOP.store(false, Ordering::SeqCst);
-    status("診断版5: 開始します");
+    status("診断版5.1: 開始します");
     let spawned = std::thread::Builder::new().name("runner-probe".into()).spawn(move || {
         let result = std::panic::catch_unwind(move || -> Result<(), String> {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
