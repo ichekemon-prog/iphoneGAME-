@@ -1,5 +1,5 @@
 //! Engine: Remote Pairing tunnel + XCTest(WDA) launcher. Game independent.
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{future::Future, pin::Pin};
 
 use idevice::{
     Idevice, IdeviceError,
@@ -141,8 +141,4 @@ pub async fn run_wda(t: &Tunnel, cfg: TestConfig) -> String {
         Ok(()) => "W2: XCTestが先に終了しました（WDAが停止）".to_string(),
         Err(e) => safe_error("W2: XCTest起動・維持", e),
     }
-}
-
-pub async fn sleep_secs(s: u64) {
-    tokio::time::sleep(Duration::from_secs(s)).await
 }

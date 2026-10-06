@@ -177,6 +177,33 @@ impl Wda {
             .map(|_| ())
     }
 
+    /// Screen size in points (the coordinate system used by tap/swipe).
+    pub async fn window_size(&self) -> Result<(f64, f64), String> {
+        let body = self.call(self.route, "画面サイズ", "GET", &format!("/session/{}/window/size", self.session), "", 15).await?;
+        let v: Value = serde_json::from_slice(&body).map_err(|_| "画面サイズ: 応答の形式が不正".to_string())?;
+        let w = v.pointer("/value/width").and_then(|x| x.as_f64()).ok_or("画面サイズ: widthなし")?;
+        let h = v.pointer("/value/height").and_then(|x| x.as_f64()).ok_or("画面サイズ: heightなし")?;
+        Ok((w, h))
+    }
+
+    /// Swipe in screen points via W3C actions.
+    pub async fn swipe(&self, x: f64, y: f64, x2: f64, y2: f64, ms: u64) -> Result<(), String> {
+        let body = json!({"actions": [{
+            "type": "pointer", "id": "finger1", "parameters": {"pointerType": "touch"},
+            "actions": [
+                {"type": "pointerMove", "duration": 0, "x": x.round(), "y": y.round()},
+                {"type": "pointerDown", "button": 0},
+                {"type": "pause", "duration": 50},
+                {"type": "pointerMove", "duration": ms, "x": x2.round(), "y": y2.round()},
+                {"type": "pointerUp", "button": 0}
+            ]
+        }]})
+        .to_string();
+        self.call(self.route, "スワイプ", "POST", &format!("/session/{}/actions", self.session), &body, 20)
+            .await
+            .map(|_| ())
+    }
+
     /// Full-resolution PNG via /screenshot (slow; ~5.7MB base64 in 診断版6).
     pub async fn screenshot_png(&self) -> Result<Vec<u8>, String> {
         let body = self.call(self.route, "画面取得", "GET", "/screenshot", "", 30).await?;

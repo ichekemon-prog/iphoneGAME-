@@ -1,11 +1,11 @@
-// Phone Runner Probe 診断版7
-// 汎用エンジン（tunnel / wda / capture）＋ 診断フロー（このファイル）。
-// ゲーム固有の情報はここにも置かない。対象アプリはアプリ側の入力で指定する。
+// Phone Runner Probe 診断版8
+// 汎用エンジン（tunnel / wda / capture）＋ 「目と手」のサービス。
+// AIの判断（頭脳）はSwift側。ここは「最新の画面を渡す」「指示された操作をする」だけ。
+// ゲーム固有の情報は置かない。
 //
-// 診断版7:
-//  - アプリ一覧モード: 端末のユーザーアプリ名とBundle IDを表示・保存
-//  - 前面アプリ観察モード: 対象アプリを前面にし、指定秒数のあいだ
-//    端末内MJPEGで画面を受信（fps計測・一定間隔でJPEG保存）し、最後にProbeへ戻る
+//  - アプリ一覧モード: target が空のとき、ユーザーアプリ名とBundle IDを表示・保存
+//  - エージェントモード: WDAを起動して対象アプリを前面にし、
+//    端末内MJPEGで最新画面を保持しながら、Swiftからの操作コマンドを実行する
 mod capture;
 mod tunnel;
 mod wda;
@@ -15,26 +15,33 @@ use std::{
     future::Future,
     path::PathBuf,
     sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc as std_mpsc,
     },
     time::Duration,
 };
 
 use idevice::IdeviceError;
-use serde_json::json;
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
+static READY: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
+static FRAME: Mutex<Option<Arc<Vec<u8>>>> = Mutex::new(None);
+static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
+static COMMANDS: Mutex<Option<mpsc::UnboundedSender<(String, std_mpsc::Sender<String>)>>> = Mutex::new(None);
 
 #[derive(Clone, Default)]
 struct Config {
     /// Empty: list installed apps only.
     target: String,
-    /// This app's Documents directory (frames and lists are saved here).
+    /// This app's Documents directory.
     documents: String,
+    /// Upper limit of one agent session.
     seconds: u64,
 }
 
@@ -69,130 +76,119 @@ async fn list_apps(mut t: tunnel::Tunnel, docs: PathBuf) -> Result<String, Strin
     let apps = tunnel::list_user_apps(&mut t).await?;
     let text: String = apps.iter().map(|(name, id)| format!("{name}\t{id}\n")).collect();
     let saved = std::fs::write(docs.join("apps.txt"), &text).is_ok();
-    Ok(format!(
-        "アプリ一覧（{}件）{}\n{text}",
-        apps.len(),
-        if saved { "・apps.txtに保存" } else { "" }
-    ))
+    Ok(format!("アプリ一覧（{}件）{}\n{text}", apps.len(), if saved { "・apps.txtに保存" } else { "" }))
 }
 
-/// Observation run. Returns a summary. Runs while the XCTest runner is alive.
-async fn observe(t: &tunnel::Tunnel, self_bundle: &str, cfg: &Config) -> Result<String, String> {
-    let docs = PathBuf::from(&cfg.documents);
-    let frames_dir = docs.join("frames");
-    let _ = std::fs::create_dir_all(&frames_dir);
-    let mut notes: Vec<String> = Vec::new();
+fn num(v: &Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(|x| x.as_f64())
+}
 
+/// Executes one command from the agent. Coordinates are normalized 0..1000
+/// (x from the left, y from the top) and converted to screen points here.
+async fn execute(w: &wda::Wda, size: (f64, f64), command: &str) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(command) else { return "error: JSONが不正".into() };
+    let to_pt = |nx: f64, ny: f64| ((nx.clamp(0.0, 1000.0) / 1000.0) * size.0, (ny.clamp(0.0, 1000.0) / 1000.0) * size.1);
+    let result = match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "tap" => match (num(&v, "x"), num(&v, "y")) {
+            (Some(x), Some(y)) => {
+                let (px, py) = to_pt(x, y);
+                w.tap(px, py).await
+            }
+            _ => Err("tap: x/yがありません".into()),
+        },
+        "swipe" => match (num(&v, "x"), num(&v, "y"), num(&v, "x2"), num(&v, "y2")) {
+            (Some(x), Some(y), Some(x2), Some(y2)) => {
+                let (a, b) = to_pt(x, y);
+                let (c, d) = to_pt(x2, y2);
+                let ms = num(&v, "ms").unwrap_or(400.0).clamp(50.0, 3000.0) as u64;
+                w.swipe(a, b, c, d, ms).await
+            }
+            _ => Err("swipe: 座標がありません".into()),
+        },
+        "activate" => match v.get("bundle").and_then(|b| b.as_str()) {
+            Some(b) => w.activate(b).await,
+            None => Err("activate: bundleがありません".into()),
+        },
+        "home" => w.home().await,
+        "status" => w.status().await,
+        other => Err(format!("未対応のコマンド: {other}")),
+    };
+    match result {
+        Ok(()) => "ok".into(),
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+/// Agent service: keeps the latest screen frame and executes commands.
+async fn service(t: &tunnel::Tunnel, cfg: &Config, mut rx: mpsc::UnboundedReceiver<(String, std_mpsc::Sender<String>)>) -> Result<String, String> {
     let mut w = wda::Wda::start(t.provider()).await?;
-    notes.push(if w.prefer_local().await { "L1: 端末内直結OK（以後は直結で操作）" } else { "L1: 直結不可（トンネルで操作）" }.into());
-
-    // Smaller, slower MJPEG frames are enough for recognition and cheaper.
-    match w
+    let local = w.prefer_local().await;
+    if let Err(e) = w
         .settings(json!({"mjpegScalingFactor": 50, "mjpegServerFramerate": 5, "mjpegServerScreenshotQuality": 40}))
         .await
     {
-        Ok(()) => notes.push("S1: MJPEG設定（50%・5fps・品質40）".into()),
-        Err(e) => notes.push(format!("S1: {e}（既定のまま続行）")),
+        status(&format!("S1: {e}（既定のまま続行）"));
     }
-
+    let size = w.window_size().await?;
     status("C0: 対象アプリを前面へ");
     w.activate(&cfg.target).await?;
-    tunnel::sleep_secs(3).await;
 
     let started = tokio::time::Instant::now();
-    let total = Duration::from_secs(cfg.seconds);
-    let (mut frames, mut bytes, mut saved, mut reconnects) = (0u64, 0u64, 0u32, 0u32);
-    let (mut tun_ok, mut tun_ng, mut wda_ok, mut wda_ng) = (0, 0, 0, 0);
-    let mut next_save = Duration::ZERO;
-    let mut next_check = Duration::from_secs(10);
-    let mut fallback_png = false;
+    let limit = Duration::from_secs(cfg.seconds);
     let mut mjpeg: Option<capture::Mjpeg> = None;
+    let (mut frames, mut commands, mut reconnects) = (0u64, 0u64, 0u32);
     let mut last_error = String::new();
+    READY.store(true, Ordering::SeqCst);
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
 
-    while started.elapsed() < total && !stopped() {
-        let elapsed = started.elapsed();
-        // C1: one frame (MJPEG, or full PNG when MJPEG is unavailable).
-        let frame: Result<(Vec<u8>, &str), String> = if fallback_png {
-            tunnel::sleep_secs(10).await;
-            w.screenshot_png().await.map(|b| (b, "png"))
-        } else {
-            if mjpeg.is_none() {
-                match capture::Mjpeg::connect().await {
-                    Ok(m) => mjpeg = Some(m),
-                    Err(e) => {
-                        reconnects += 1;
-                        last_error = e;
-                        if reconnects >= 3 {
-                            fallback_png = true;
-                            notes.push(format!("C1: MJPEG不可→PNG取得に切替（{last_error}）"));
-                        }
-                        tunnel::sleep_secs(2).await;
-                        continue;
-                    }
-                }
-            }
-            match tokio::time::timeout(Duration::from_secs(10), mjpeg.as_mut().unwrap().next_frame()).await {
-                Ok(Ok(f)) => Ok((f, "jpg")),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err("MJPEG: 10秒フレームなし".into()),
-            }
-        };
-        match frame {
-            Ok((data, ext)) => {
-                frames += 1;
-                bytes += data.len() as u64;
-                if elapsed >= next_save && saved < 20 {
-                    if std::fs::write(frames_dir.join(format!("frame_{:03}.{ext}", elapsed.as_secs())), &data).is_ok() {
-                        saved += 1;
-                    }
-                    next_save = elapsed + Duration::from_secs(15);
-                }
-            }
-            Err(e) => {
-                last_error = e;
-                mjpeg = None;
-                reconnects += 1;
-                if reconnects >= 10 && !fallback_png {
-                    fallback_png = true;
-                    notes.push(format!("C1: MJPEG不安定→PNG取得に切替（{last_error}）"));
+    while started.elapsed() < limit && !stopped() {
+        if mjpeg.is_none() {
+            match capture::Mjpeg::connect().await {
+                Ok(m) => mjpeg = Some(m),
+                Err(e) => {
+                    reconnects += 1;
+                    last_error = e;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
                 }
             }
         }
-        // C2: every 10 s check WDA (current route) and the tunnel separately.
-        if started.elapsed() >= next_check {
-            next_check = started.elapsed() + Duration::from_secs(10);
-            if w.status().await.is_ok() { wda_ok += 1 } else { wda_ng += 1 }
-            if w.call(wda::Route::Tunnel, "T", "GET", "/status", "", 8).await.is_ok() { tun_ok += 1 } else { tun_ng += 1 }
+        let m = mjpeg.as_mut().unwrap();
+        tokio::select! {
+            frame = m.next_frame() => match frame {
+                Ok(f) => {
+                    frames += 1;
+                    if let Ok(mut slot) = FRAME.lock() { *slot = Some(Arc::new(f)); }
+                    FRAME_SEQ.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(e) => { last_error = e; mjpeg = None; reconnects += 1; }
+            },
+            cmd = rx.recv() => match cmd {
+                Some((command, reply)) => {
+                    commands += 1;
+                    let _ = reply.send(execute(&w, size, &command).await);
+                }
+                None => break,
+            },
+            _ = tick.tick() => {
+                status(&format!(
+                    "エージェント接続中 {}秒 / 画面{frames}枚 / 操作{commands}回 / 再接続{reconnects}回\n画面サイズ {:.0}x{:.0}pt・{}{}",
+                    started.elapsed().as_secs(), size.0, size.1,
+                    if local { "端末内直結" } else { "トンネル経由" },
+                    if last_error.is_empty() { String::new() } else { format!("\n最後のエラー: {last_error}") }
+                ));
+            }
         }
-        let secs = started.elapsed().as_secs_f64().max(0.1);
-        status(&format!(
-            "C1: 観察中 {:.0}/{}秒\n受信{frames}枚（{:.1}fps, 平均{}KB）保存{saved}枚\nWDA {wda_ok}OK/{wda_ng}NG, トンネル {tun_ok}OK/{tun_ng}NG",
-            secs,
-            cfg.seconds,
-            frames as f64 / secs,
-            if frames > 0 { bytes / frames / 1024 } else { 0 }
-        ));
     }
-    let secs = started.elapsed().as_secs_f64().max(0.1);
-    drop(mjpeg);
-
-    status("C3: Probeを前面に戻す");
-    let back = match w.activate(self_bundle).await {
-        Ok(()) => "C3: Probeへ復帰".to_string(),
-        Err(e) => format!("C3: {e}"),
-    };
+    READY.store(false, Ordering::SeqCst);
     let _ = w.call(w.route, "終了", "DELETE", &format!("/session/{}", w.session), "", 10).await;
     Ok(format!(
-        "診断版7: 完了（{:.0}秒）\n{}\n受信{frames}枚 {:.1}fps 平均{}KB / 再接続{reconnects}回\n保存{saved}枚（ファイル→このiPhone内→Phone Runner Probe→frames）\nWDA {wda_ok}OK/{wda_ng}NG, トンネル {tun_ok}OK/{tun_ng}NG{}\n{back}",
-        secs,
-        notes.join("\n"),
-        frames as f64 / secs,
-        if frames > 0 { bytes / frames / 1024 } else { 0 },
-        if last_error.is_empty() { String::new() } else { format!("\n最後のエラー: {last_error}") }
+        "エージェント接続終了（{}秒）画面{frames}枚 / 操作{commands}回 / 再接続{reconnects}回",
+        started.elapsed().as_secs()
     ))
 }
 
-async fn probe(path: String, host: String, runner: String, self_bundle: String, cfg: Config) -> Result<String, String> {
+async fn probe(path: String, host: String, runner: String, cfg: Config) -> Result<String, String> {
     let addr = host.parse::<std::net::IpAddr>().map_err(|_| "接続先IPアドレスが不正です".to_string())?;
     let mut t = tunnel::open(path, addr).await?;
     if cfg.target.is_empty() {
@@ -202,15 +198,23 @@ async fn probe(path: String, host: String, runner: String, self_bundle: String, 
         return Err("WDAのBundle IDが未入力です".into());
     }
     let runner_cfg = tunnel::runner_config(&mut t, &runner).await?;
-    status("W2: XCTestでWDAを起動中（WDA画面が前面に出る場合があります）");
-    tokio::select! {
-        message = tunnel::run_wda(&t, runner_cfg) => Err(message),
-        result = observe(&t, &self_bundle, &cfg) => result,
+    let (tx, rx) = mpsc::unbounded_channel();
+    if let Ok(mut c) = COMMANDS.lock() {
+        *c = Some(tx);
     }
+    status("W2: XCTestでWDAを起動中（WDA画面が前面に出る場合があります）");
+    let result = tokio::select! {
+        message = tunnel::run_wda(&t, runner_cfg) => Err(message),
+        result = service(&t, &cfg, rx) => result,
+    };
+    if let Ok(mut c) = COMMANDS.lock() {
+        *c = None;
+    }
+    result
 }
 
-/// Call before probe_start. target: bundle id of the app to observe (empty =
-/// list apps), documents: this app's Documents path, seconds: 30..1800.
+/// Call before probe_start. target: bundle id of the app to operate (empty =
+/// list apps), documents: this app's Documents path, seconds: session limit.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn probe_configure(target: *const c_char, documents: *const c_char, seconds: u32) -> bool {
     if target.is_null() || documents.is_null() {
@@ -218,7 +222,7 @@ pub unsafe extern "C" fn probe_configure(target: *const c_char, documents: *cons
     }
     let read = |p: *const c_char| unsafe { CStr::from_ptr(p) }.to_str().map(str::to_owned);
     let (Ok(target), Ok(documents)) = (read(target), read(documents)) else { return false };
-    let seconds = (seconds as u64).clamp(30, 1800);
+    let seconds = (seconds as u64).clamp(30, 7200);
     if let Ok(mut c) = CONFIG.lock() {
         *c = Some(Config { target, documents, seconds });
         return true;
@@ -226,11 +230,11 @@ pub unsafe extern "C" fn probe_configure(target: *const c_char, documents: *cons
     false
 }
 
-/// Copies arguments before returning. `runner` is the WDA xctrunner bundle id,
-/// `self_bundle` is this app's bundle id (used to come back to the front).
+/// Copies arguments before returning. `runner` is the WDA xctrunner bundle id.
+/// `_self_bundle` is kept for ABI compatibility.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn probe_start(path: *const c_char, host: *const c_char, runner: *const c_char, self_bundle: *const c_char) -> bool {
-    if path.is_null() || host.is_null() || runner.is_null() || self_bundle.is_null() {
+pub unsafe extern "C" fn probe_start(path: *const c_char, host: *const c_char, runner: *const c_char, _self_bundle: *const c_char) -> bool {
+    if path.is_null() || host.is_null() || runner.is_null() {
         return false;
     }
     let Some(cfg) = CONFIG.lock().ok().and_then(|c| c.clone()) else {
@@ -241,12 +245,16 @@ pub unsafe extern "C" fn probe_start(path: *const c_char, host: *const c_char, r
         return false;
     }
     let read = |p: *const c_char| unsafe { CStr::from_ptr(p) }.to_str().map(str::to_owned);
-    let (Ok(path), Ok(host), Ok(runner), Ok(self_bundle)) = (read(path), read(host), read(runner), read(self_bundle)) else {
+    let (Ok(path), Ok(host), Ok(runner)) = (read(path), read(host), read(runner)) else {
         RUNNING.store(false, Ordering::SeqCst);
         return false;
     };
     STOP.store(false, Ordering::SeqCst);
-    status("診断版7: 開始します");
+    READY.store(false, Ordering::SeqCst);
+    if let Ok(mut f) = FRAME.lock() {
+        *f = None;
+    }
+    status("診断版8: 開始します");
     let limit = cfg.seconds + 240;
     let spawned = std::thread::Builder::new().name("runner-probe".into()).spawn(move || {
         let result = std::panic::catch_unwind(move || -> Result<String, String> {
@@ -254,13 +262,17 @@ pub unsafe extern "C" fn probe_start(path: *const c_char, host: *const c_char, r
                 .map_err(|_| "実行環境を作成できません".to_string())?;
             runtime.block_on(async {
                 tokio::select! {
-                    result = tokio::time::timeout(Duration::from_secs(limit), probe(path, host, runner, self_bundle, cfg)) =>
-                        result.map_err(|_| "試験全体がタイムアウトしました".to_string())?,
+                    result = tokio::time::timeout(Duration::from_secs(limit), probe(path, host, runner, cfg)) =>
+                        result.map_err(|_| "全体の制限時間に達しました".to_string())?,
                     _ = async { while !stopped() { tokio::time::sleep(Duration::from_millis(100)).await; } } =>
                         Ok("停止しました".to_string()),
                 }
             })
         });
+        READY.store(false, Ordering::SeqCst);
+        if let Ok(mut c) = COMMANDS.lock() {
+            *c = None;
+        }
         match result {
             Ok(Ok(message)) => status(&message),
             Ok(Err(e)) => status(&e),
@@ -274,6 +286,62 @@ pub unsafe extern "C" fn probe_start(path: *const c_char, host: *const c_char, r
         return false;
     }
     true
+}
+
+/// True while WDA is up, the target app was brought to the front and frames
+/// and commands are being served.
+#[unsafe(no_mangle)]
+pub extern "C" fn agent_ready() -> bool {
+    READY.load(Ordering::SeqCst)
+}
+
+/// Increments every time a new frame arrives.
+#[unsafe(no_mangle)]
+pub extern "C" fn agent_frame_seq() -> u64 {
+    FRAME_SEQ.load(Ordering::SeqCst)
+}
+
+/// Copies the latest JPEG frame. Returns null when none. Free with agent_free_frame.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agent_copy_frame(len_out: *mut usize) -> *mut u8 {
+    if len_out.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(frame) = FRAME.lock().ok().and_then(|f| f.clone()) else { return std::ptr::null_mut() };
+    let boxed: Box<[u8]> = frame.as_slice().into();
+    unsafe { *len_out = boxed.len() };
+    Box::into_raw(boxed) as *mut u8
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agent_free_frame(p: *mut u8, len: usize) {
+    if !p.is_null() {
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, len)) });
+    }
+}
+
+/// Runs one command (JSON, see execute()) and blocks until it finishes
+/// (max 30 s). Returns "ok" or "error: ...". Free with probe_free_string.
+/// Do not call from the main thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agent_command(json: *const c_char) -> *mut c_char {
+    let answer = (|| {
+        if json.is_null() {
+            return "error: 空のコマンド".to_string();
+        }
+        let Ok(command) = unsafe { CStr::from_ptr(json) }.to_str().map(str::to_owned) else {
+            return "error: 文字コードが不正".to_string();
+        };
+        let Some(tx) = COMMANDS.lock().ok().and_then(|c| c.clone()) else {
+            return "error: エージェント接続がありません".to_string();
+        };
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        if tx.send((command, reply_tx)).is_err() {
+            return "error: エージェント接続が終了しています".to_string();
+        }
+        reply_rx.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| "error: 30秒以内に応答なし".to_string())
+    })();
+    CString::new(answer).unwrap_or_default().into_raw()
 }
 
 #[unsafe(no_mangle)]
