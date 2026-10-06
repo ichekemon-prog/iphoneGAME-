@@ -1,13 +1,13 @@
 [package]
 name = "phone_runner_probe"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2024"
 
 [lib]
 crate-type = ["staticlib"]
 
+# idevice is cloned at the pinned revision d32c8189c51c2789496b0768039419c3705498c3
+# and patched with patches/idevice-run-over-rsd.patch by the build workflow.
 [dependencies]
-idevice = { git = "https://github.com/jkcoxson/idevice", rev = "d32c8189c51c2789496b0768039419c3705498c3", default-features = false, features = ["ring", "tcp", "remote_pairing", "rsd", "tunnel_tcp_stack"] }
+idevice = { path = "../vendor/idevice/idevice", default-features = false, features = ["ring", "tcp", "remote_pairing", "rsd", "tunnel_tcp_stack", "installation_proxy", "xctest", "wda"] }
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"] }
-
-

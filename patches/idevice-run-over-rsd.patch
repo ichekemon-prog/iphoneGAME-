@@ -1,0 +1,117 @@
+diff --git a/idevice/src/services/dvt/xctest/mod.rs b/idevice/src/services/dvt/xctest/mod.rs
+index 3705645..eaff8ae 100644
+--- a/idevice/src/services/dvt/xctest/mod.rs
++++ b/idevice/src/services/dvt/xctest/mod.rs
+@@ -655,6 +655,45 @@ async fn connect_testmanagerd_rsd(
+     )))
+ }
+ 
++/// Establishes the three DTX connections over a caller-supplied RSD tunnel
++/// (for example one created from a Remote Pairing record). There is no
++/// lockdown fallback because the caller may have no lockdown provider.
++async fn connect_testmanagerd_over_rsd(
++    mut handle: crate::tcp::handle::AdapterHandle,
++    handshake: &RsdHandshake,
++) -> Result<TestManagerConnections, IdeviceError> {
++    let dvt = rsd_connect(
++        &mut handle,
++        handshake,
++        "com.apple.instruments.dtservicehub",
++        "dtservicehub",
++        true,
++    )
++    .await?;
++    let ctrl = rsd_connect(
++        &mut handle,
++        handshake,
++        TESTMANAGERD_RSD_SERVICE,
++        "testmanagerd-ctrl",
++        false,
++    )
++    .await?;
++    let main = rsd_connect(
++        &mut handle,
++        handshake,
++        TESTMANAGERD_RSD_SERVICE,
++        "testmanagerd-main",
++        false,
++    )
++    .await?;
++    Ok(TestManagerConnections {
++        ctrl,
++        main,
++        dvt,
++        rsd_handles: vec![handle],
++    })
++}
++
+ /// Establishes the three DTX connections required for an XCTest run.
+ ///
+ /// For iOS 17+ tries `CoreDeviceProxy` + RSD first. Falls back to lockdown
+@@ -2002,11 +2041,63 @@ impl XCUITestService {
+                 .unwrap_or(16u8)
+         };
+ 
++        // 4. Connect to testmanagerd (ctrl + main) and DVT
++        let conns = connect_testmanagerd(&*self.provider, ios_major_version).await?;
++        Self::run_with_connections(
++            cfg,
++            session_id,
++            xctest_path,
++            ios_major_version,
++            conns,
++            listener,
++            timeout,
++        )
++        .await
++    }
++
++    /// Runs the XCTest bundle over an already-established RSD tunnel.
++    ///
++    /// Unlike [`XCUITestService::run`], this never touches lockdown or
++    /// CoreDeviceProxy. `handle` must belong to a live tunnel and `handshake`
++    /// must come from that tunnel's RSD port. The caller supplies the iOS
++    /// major version (for example from the RSD handshake properties).
++    pub async fn run_over_rsd<L: XCUITestListener>(
++        handle: crate::tcp::handle::AdapterHandle,
++        handshake: &RsdHandshake,
++        ios_major_version: u8,
++        cfg: TestConfig,
++        listener: &mut L,
++        timeout: Option<std::time::Duration>,
++    ) -> Result<(), IdeviceError> {
++        let session_id = uuid::Uuid::new_v4();
++        let xctest_path = format!(
++            "/tmp/{}.xctestconfiguration",
++            session_id.to_string().to_uppercase()
++        );
++        let conns = connect_testmanagerd_over_rsd(handle, handshake).await?;
++        Self::run_with_connections(
++            cfg,
++            session_id,
++            xctest_path,
++            ios_major_version,
++            conns,
++            listener,
++            timeout,
++        )
++        .await
++    }
++
++    async fn run_with_connections<L: XCUITestListener>(
++        cfg: TestConfig,
++        session_id: uuid::Uuid,
++        xctest_path: String,
++        ios_major_version: u8,
++        mut conns: TestManagerConnections,
++        listener: &mut L,
++        timeout: Option<std::time::Duration>,
++    ) -> Result<(), IdeviceError> {
+         // 3. Build XCTestConfiguration
+         let xctest_config = cfg.build_xctest_configuration(session_id, ios_major_version)?;
+-
+-        // 4. Connect to testmanagerd (ctrl + main) and DVT
+-        let mut conns = connect_testmanagerd(&*self.provider, ios_major_version).await?;
+         let mut ctrl_proxy = TestManagerProxy::open(&mut conns.ctrl, ios_major_version).await?;
+         let mut main_proxy = TestManagerProxy::open(&mut conns.main, ios_major_version).await?;
+         let mut process_control = XCTestProcessControlChannel::open(&mut conns.dvt).await?;
