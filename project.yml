@@ -11,6 +11,8 @@ targets:
       path: Support/Info.plist
       properties:
         UIBackgroundModes: [audio]
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.local.PhoneRunnerProbe

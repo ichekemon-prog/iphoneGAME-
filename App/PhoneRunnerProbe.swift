@@ -55,64 +55,62 @@ struct ProbeView: View {
     @Environment(\.scenePhase) private var phase
     @AppStorage("targetIP") private var host = "10.7.0.1"
     @AppStorage("runnerBundle") private var runner = ""
+    @AppStorage("observeBundle") private var target = ""
+    @AppStorage("observeSeconds") private var seconds = 300
+    @AppStorage("keepAliveAudio") private var keepAlive = true
     @State private var importing = false
-    @State private var status = "診断版6: 背景での維持試験"
+    @State private var status = "診断版7: 前面アプリの画面受信試験"
     @State private var running = false
     @State private var hasPairing = false
-    @State private var wdaTaps = 0
-    @AppStorage("keepAliveAudio") private var keepAlive = true
     @State private var audioNote = ""
     @State private var lifecycle = "前面で待機中"
     @State private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-    private var pairingURL: URL {
+    private var supportURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("remote-pairing.plist")
+    }
+    private var pairingURL: URL { supportURL.appendingPathComponent("remote-pairing.plist") }
+    private var documentsURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // WDA taps the center of this target. Do not tap it by hand during the test.
-            Button { wdaTaps += 1 } label: {
-                VStack {
-                    Text("タップ目標（手で触らないでください）").font(.headline)
-                    Text("WDAからのタップ回数: \(wdaTaps)").font(.title2.bold())
+        NavigationStack {
+            Form {
+                Section("診断版7") {
+                    Text("①『アプリ一覧を取得』で対象アプリのBundle IDを確認 → ②下の欄に入力 → ③『前面アプリ観察を開始』。")
+                    Text("観察中は対象アプリが前面になり、Probeは背景で画面を受信します（タップはしません）。終了すると自動でこの画面に戻ります。保存画像は『ファイル』アプリ→このiPhone内→Phone Runner Probe→frames。")
+                    Toggle("背景維持（無音オーディオ）", isOn: $keepAlive)
+                    if !audioNote.isEmpty { Text(audioNote).font(.footnote) }
                 }
-                .frame(maxWidth: .infinity, minHeight: 110)
-                .background(wdaTaps > 0 ? Color.green.opacity(0.35) : Color.orange.opacity(0.25))
-            }
-            .buttonStyle(.plain)
-            .background(GeometryReader { geo in
-                Color.clear
-                    .onAppear { report(geo.frame(in: .global)) }
-                    .onChange(of: geo.frame(in: .global)) { report($0) }
-            })
-
-            NavigationStack {
-                Form {
-                    Section("診断版6") {
-                        Text("WDA起動→目標を1回タップ→WDAがホーム画面へ移動し、約90秒Probeを背景にしたまま接続・画面取得を確認→自動でこの画面に戻ります。")
-                        Text("試験中はiPhoneに触らずに待ってください（約3〜4分）。戻らない場合は手でこのアプリを開いてください。")
-                        Toggle("背景維持（無音オーディオ）", isOn: $keepAlive)
-                        if !audioNote.isEmpty { Text(audioNote).font(.footnote) }
+                Section("接続設定") {
+                    TextField("VPNの接続先IP", text: $host)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    TextField("WDAのBundle ID", text: $runner)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    Button("認証ファイルを読み込む") { importing = true }
+                    Text(hasPairing ? "Remote Pairing情報を確認済み（端末内のみ）" : "Remote Pairing情報が未設定、または形式が不正です")
+                }.disabled(running)
+                Section("観察設定") {
+                    TextField("対象アプリのBundle ID", text: $target)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    Picker("観察時間", selection: $seconds) {
+                        Text("1分").tag(60)
+                        Text("5分").tag(300)
+                        Text("10分").tag(600)
+                        Text("30分").tag(1800)
                     }
-                    Section("接続設定") {
-                        TextField("VPNの接続先IP", text: $host)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled()
-                        TextField("WDAのBundle ID", text: $runner)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled()
-                        Button("認証ファイルを読み込む") { importing = true }
-                        Text(hasPairing ? "Remote Pairing情報を確認済み（端末内のみ）" : "Remote Pairing情報が未設定、または形式が不正です")
-                    }.disabled(running)
-                    Section("試験") {
-                        Button("背景維持試験を開始") { start() }
-                            .disabled(running || !hasPairing || runner.isEmpty)
-                        Button("停止", role: .destructive) { probe_stop() }.disabled(!running)
-                        Text(status).textSelection(.enabled)
-                        Text(lifecycle).font(.footnote)
-                    }
-                }.navigationTitle("Phone Runner Probe")
-            }
+                }.disabled(running)
+                Section("試験") {
+                    Button("アプリ一覧を取得") { start(list: true) }
+                        .disabled(running || !hasPairing)
+                    Button("前面アプリ観察を開始") { start(list: false) }
+                        .disabled(running || !hasPairing || runner.isEmpty || target.isEmpty)
+                    Button("停止", role: .destructive) { probe_stop() }.disabled(!running)
+                    Text(status).textSelection(.enabled)
+                    Text(lifecycle).font(.footnote)
+                }
+            }.navigationTitle("Phone Runner Probe")
         }
         .onAppear { refreshPairing() }
         .onReceive(timer) { _ in
@@ -155,9 +153,9 @@ struct ProbeView: View {
                       isRemotePairing(plist) else {
                     throw CocoaError(.fileReadCorruptFile)
                 }
-                try FileManager.default.createDirectory(at: pairingURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: supportURL, withIntermediateDirectories: true)
                 try data.write(to: pairingURL, options: [.atomic, .completeFileProtection])
-                var directory = pairingURL.deletingLastPathComponent()
+                var directory = supportURL
                 var values = URLResourceValues(); values.isExcludedFromBackup = true
                 try directory.setResourceValues(values)
                 refreshPairing()
@@ -166,9 +164,6 @@ struct ProbeView: View {
         }
     }
 
-    private func report(_ frame: CGRect) {
-        probe_set_tap_point(Double(frame.midX), Double(frame.midY))
-    }
     private func isRemotePairing(_ plist: [String: Any]) -> Bool {
         guard let publicKey = plist["public_key"] as? Data, publicKey.count == 32,
               let privateKey = plist["private_key"] as? Data, privateKey.count == 32,
@@ -181,18 +176,24 @@ struct ProbeView: View {
               let plist = object as? [String: Any] else { hasPairing = false; return }
         hasPairing = isRemotePairing(plist)
     }
-    private func start() {
+    private func start(list: Bool) {
         let selfBundle = Bundle.main.bundleIdentifier ?? ""
         let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let r = runner.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = list ? "" : target.trimmingCharacters(in: .whitespacesAndNewlines)
+        let docs = documentsURL.path
+        let configured = t.withCString { tp in docs.withCString { dp in probe_configure(tp, dp, UInt32(seconds)) } }
+        guard configured else { status = "設定を渡せませんでした"; return }
         let ok = pairingURL.path.withCString { p in
             h.withCString { hp in r.withCString { rp in selfBundle.withCString { sp in probe_start(p, hp, rp, sp) } } }
         }
         running = ok
         if ok {
-            wdaTaps = 0
-            if keepAlive { audioNote = SilentAudio.shared.start() ? "無音オーディオ再生中" : "無音オーディオを開始できません" }
-            else { audioNote = "背景維持なし（猶予のみ）" }
+            if !list && keepAlive {
+                audioNote = SilentAudio.shared.start() ? "無音オーディオ再生中" : "無音オーディオを開始できません"
+            } else if !list {
+                audioNote = "背景維持なし（猶予のみ）"
+            }
         } else { status = "試験を開始できませんでした" }
     }
     private func endBackgroundTask() {
