@@ -7,6 +7,7 @@ void probe_stop(void);
 bool probe_running(void);
 char *probe_status(void);
 bool probe_enable_diagnostics(void);
+void probe_set_ddi_dir(const char *path);
 char *probe_diagnostics(void);
 void probe_free_string(char *p);
 bool agent_ready(void);

@@ -48,7 +48,8 @@ fn hint(id: &str) -> &'static str {
         "R1" | "R5" => "LocalDevVPNの接続とDevice IPを確認してください。VPN状態そのものを判定した結果ではありません。",
         "R2" | "R3" => "端末のロックを解除し、この端末用の認証ファイルか確認してください。解消しなければ再ペアリングを確認します。",
         "R4" | "R6" | "R7" | "R8" => "VPNを再接続して診断をやり直してください。直らない場合はこの診断結果を保存してください。",
-        "DDI" => "開発者モードを確認してください。再起動後ならDDIの再準備が必要な可能性があります。サービス一覧だけではDDI未マウントとは断定できません。",
+        "DDI" | "D0" => "『開発用ディスクイメージを準備』でファイルを取得してから、もう一度診断してください。開発者モードがONかも確認してください。",
+        "D1" | "D2" | "D3" | "D4" => "インターネットに接続できるか（Appleの署名サーバーへの通信が必要）を確認し、もう一度診断してください。直らない場合はこの結果を保存してください。",
         "W1" => "WDAのインストール状態とBundle IDを確認してください。",
         "WDA" => "WDAの署名期限・開発者モード・開発用サービスを確認してください。",
         "LOCAL" | "FRAME" => "WDAを起動し直して再診断してください。接続先は端末内の8100/9100ポートです。",
@@ -67,13 +68,22 @@ async fn check<T>(id: &str, seconds: u64, task: impl Future<Output = Result<T, S
     result
 }
 
-pub async fn run(mut t: tunnel::Tunnel, runner: &str) -> Result<String, String> {
+pub async fn run(mut t: tunnel::Tunnel, runner: &str, ddi_dir: &str) -> Result<String, String> {
     // Presence is evidence of service advertisement, not proof of a mounted DDI.
-    let testmanager = t.handshake.services.keys().any(|name| name.contains("testmanagerd"));
+    let testmanager = crate::ddi::has_testmanager(&t.handshake);
     let instruments = t.handshake.services.keys().any(|name| name.contains("dtservicehub"));
-    record("DDI", if testmanager && instruments { "passed" } else { "warning" },
-        &format!("開発用サービスの広告: testmanagerd={} / dtservicehub={}。DDIの直接確認・マウントは未実装。",
-            testmanager, instruments));
+    if testmanager {
+        record("DDI", "passed", &format!("開発用サービスの広告: testmanagerd=true / dtservicehub={instruments}"));
+    } else {
+        record("DDI", "running", "testmanagerdが見つかりません。開発用ディスクイメージのマウントを試みます（再起動後に必要）");
+        match crate::ddi::ensure(&mut t, ddi_dir).await {
+            Ok(_) => record("DDI", "passed", "開発用ディスクイメージをマウントし、testmanagerdを確認しました"),
+            Err(e) => {
+                record("DDI", "failed", &e);
+                return Err(e);
+            }
+        }
+    }
     if runner.trim().is_empty() {
         record("W1", "failed", "WDAのBundle IDが未入力です");
         return Err("WDAのBundle IDを入力してください".into());

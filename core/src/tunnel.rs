@@ -41,9 +41,17 @@ pub struct Tunnel {
     pub handle: AdapterHandle,
     pub handshake: RsdHandshake,
     pub ios_major: u8,
+    pub rsd_port: u16,
 }
 
 impl Tunnel {
+    /// Re-reads the advertised services over the same tunnel (e.g. after a DDI mount).
+    pub async fn refresh(&mut self) -> Result<(), IdeviceError> {
+        let stream = self.handle.connect(self.rsd_port).await.map_err(IdeviceError::Socket)?;
+        self.handshake = RsdHandshake::new(stream).await?;
+        Ok(())
+    }
+
     pub fn provider(&self) -> TunnelProvider {
         TunnelProvider { handle: self.handle.clone() }
     }
@@ -100,7 +108,7 @@ pub async fn open(path: String, addr: std::net::IpAddr) -> Result<Tunnel, String
     }
     let ios_major = ios_major(&handshake);
     status(&format!("R8: 成功（{}サービス, iOS {ios_major}）", handshake.services.len()));
-    Ok(Tunnel { handle, handshake, ios_major })
+    Ok(Tunnel { handle, handshake, ios_major, rsd_port })
 }
 
 /// Installed user apps as (display name, bundle id), sorted by name.

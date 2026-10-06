@@ -71,6 +71,9 @@ struct ProbeView: View {
     @State private var status = "診断版8: AIエージェント"
     @State private var running = false
     @State private var connectionReport = ConnectionReport.empty
+    @State private var ddiReady = DiskImage.ready
+    @State private var ddiBusy = false
+    @State private var ddiNote = ""
     @State private var hasPairing = false
     @State private var audioNote = ""
     @State private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
@@ -87,6 +90,13 @@ struct ProbeView: View {
                         .font(.footnote)
                     Button("接続を診断する") { startDiagnostics() }
                         .disabled(running || agent.active)
+                    Text(ddiReady ? "開発用ディスクイメージ：準備済み（再起動後は診断・開始時に自動でマウント）"
+                                  : "開発用ディスクイメージ：未準備（再起動後の復旧に必要）")
+                        .font(.footnote)
+                    Button(ddiBusy ? "取得中…" : (ddiReady ? "開発用ディスクイメージを取り直す" : "開発用ディスクイメージを準備（約16MB）")) {
+                        prepareDiskImage()
+                    }.disabled(ddiBusy || running || agent.active)
+                    if !ddiNote.isEmpty { Text(ddiNote).font(.caption) }
                     ConnectionDiagnosticsView(report: connectionReport)
                 }
                 Section("指示") {
@@ -229,12 +239,27 @@ struct ProbeView: View {
         let configured = t.withCString { tp in docs.withCString { dp in probe_configure(tp, dp, 3600) } }
         guard configured else { status = "設定を渡せませんでした"; return false }
         if diagnostic && !probe_enable_diagnostics() { status = "診断を準備できませんでした"; return false }
+        DiskImage.directory.path.withCString { probe_set_ddi_dir($0) }
         let ok = pairingURL.path.withCString { p in
             h.withCString { hp in r.withCString { rp in selfBundle.withCString { sp in probe_start(p, hp, rp, sp) } } }
         }
         running = ok
         if !ok { status = "開始できませんでした" }
         return ok
+    }
+    private func prepareDiskImage() {
+        ddiBusy = true
+        ddiNote = "取得中（Wi-Fi推奨）…"
+        Task {
+            do {
+                try await DiskImage.download()
+                ddiNote = "取得しました"
+            } catch {
+                ddiNote = "取得できませんでした: \(error.localizedDescription)"
+            }
+            ddiReady = DiskImage.ready
+            ddiBusy = false
+        }
     }
     private func startDiagnostics() {
         guard !running && !agent.active else { return }

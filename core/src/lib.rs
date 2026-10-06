@@ -7,6 +7,7 @@
 //  - エージェントモード: WDAを起動して対象アプリを前面にし、
 //    端末内MJPEGで最新画面を保持しながら、Swiftからの操作コマンドを実行する
 mod capture;
+mod ddi;
 mod diagnostics;
 mod tunnel;
 mod wda;
@@ -32,6 +33,8 @@ static READY: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
+/// Directory holding Image.dmg / Image.dmg.trustcache / BuildManifest.plist.
+static DDI_DIR: Mutex<String> = Mutex::new(String::new());
 static FRAME: Mutex<Option<Arc<Vec<u8>>>> = Mutex::new(None);
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 static COMMANDS: Mutex<Option<mpsc::UnboundedSender<(String, std_mpsc::Sender<String>)>>> = Mutex::new(None);
@@ -199,14 +202,19 @@ async fn service(t: &tunnel::Tunnel, cfg: &Config, mut rx: mpsc::UnboundedReceiv
 async fn probe(path: String, host: String, runner: String, cfg: Config) -> Result<String, String> {
     let addr = host.parse::<std::net::IpAddr>().map_err(|_| "接続先IPアドレスが不正です".to_string())?;
     let mut t = tunnel::open(path, addr).await?;
+    let ddi_dir = DDI_DIR.lock().map(|d| d.clone()).unwrap_or_default();
     if cfg.diagnostic {
-        return diagnostics::run(t, &runner).await;
+        return diagnostics::run(t, &runner, &ddi_dir).await;
     }
     if cfg.target.is_empty() {
         return list_apps(t, PathBuf::from(&cfg.documents)).await;
     }
     if runner.is_empty() {
         return Err("WDAのBundle IDが未入力です".into());
+    }
+    // After a reboot the Developer Disk Image is gone; restore it on the device.
+    if ddi::ensure(&mut t, &ddi_dir).await? {
+        status("D: 開発用ディスクイメージをマウントしました");
     }
     let runner_cfg = tunnel::runner_config(&mut t, &runner).await?;
     let (tx, rx) = mpsc::unbounded_channel();
@@ -315,6 +323,17 @@ pub extern "C" fn probe_enable_diagnostics() -> bool {
         if let Some(c) = config.as_mut() { c.diagnostic = true; c.seconds = 60; return true; }
     }
     false
+}
+
+/// Directory of the Developer Disk Image files (downloaded by the app).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn probe_set_ddi_dir(path: *const c_char) {
+    if path.is_null() {
+        return;
+    }
+    if let (Ok(p), Ok(mut d)) = (unsafe { CStr::from_ptr(path) }.to_str(), DDI_DIR.lock()) {
+        *d = p.to_owned();
+    }
 }
 
 /// Caller frees with probe_free_string. Contains no raw pairing/service data.
