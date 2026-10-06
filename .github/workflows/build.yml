@@ -6,7 +6,7 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools
@@ -14,6 +14,12 @@ jobs:
           brew install xcodegen
           rustup toolchain install stable --profile minimal
           rustup target add --toolchain stable aarch64-apple-ios
+      - name: Fetch pinned idevice and apply local patch
+        run: |
+          git clone https://github.com/jkcoxson/idevice vendor/idevice
+          git -C vendor/idevice checkout d32c8189c51c2789496b0768039419c3705498c3
+          git -C vendor/idevice apply ../../patches/idevice-run-over-rsd.patch
+          git -C vendor/idevice diff --stat
       - name: Build Rust core
         working-directory: core
         run: cargo +stable build --release --target aarch64-apple-ios
