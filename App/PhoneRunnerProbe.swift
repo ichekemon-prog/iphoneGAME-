@@ -1,6 +1,50 @@
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
+import AVFoundation
+
+/// Plays silence so iOS keeps this app running in the background
+/// (UIBackgroundModes=audio). Mixes with other apps, so the game's sound is kept.
+final class SilentAudio {
+    static let shared = SilentAudio()
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+    private var attached = false
+    private(set) var active = false
+
+    func start() -> Bool {
+        if active { return true }
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, options: [.mixWithOthers])
+            try session.setActive(true)
+            guard let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2),
+                  let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 44_100) else { return false }
+            buffer.frameLength = 44_100
+            if let channels = buffer.floatChannelData {
+                for c in 0..<Int(format.channelCount) { channels[c].update(repeating: 0, count: 44_100) }
+            }
+            if !attached {
+                engine.attach(player)
+                engine.connect(player, to: engine.mainMixerNode, format: format)
+                attached = true
+            }
+            try engine.start()
+            player.scheduleBuffer(buffer, at: nil, options: .loops)
+            player.play()
+            active = true
+            return true
+        } catch { return false }
+    }
+
+    func stop() {
+        guard active else { return }
+        player.stop()
+        engine.stop()
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        active = false
+    }
+}
 
 @main
 struct PhoneRunnerProbeApp: App {
@@ -12,10 +56,12 @@ struct ProbeView: View {
     @AppStorage("targetIP") private var host = "10.7.0.1"
     @AppStorage("runnerBundle") private var runner = ""
     @State private var importing = false
-    @State private var status = "診断版5: WDA起動とタップの試験"
+    @State private var status = "診断版6: 背景での維持試験"
     @State private var running = false
     @State private var hasPairing = false
     @State private var wdaTaps = 0
+    @AppStorage("keepAliveAudio") private var keepAlive = true
+    @State private var audioNote = ""
     @State private var lifecycle = "前面で待機中"
     @State private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -44,9 +90,11 @@ struct ProbeView: View {
 
             NavigationStack {
                 Form {
-                    Section("診断版5") {
-                        Text("LocalDevVPNを接続してから開始します。Remote Pairingのトンネル上でWDAを起動し、上の目標を1回タップします。")
-                        Text("WDAの画面が一時的に前面に出たら、そのまま待ってください（自動でこの画面に戻ります）。戻らない場合は手でこのアプリを開いてください。")
+                    Section("診断版6") {
+                        Text("WDA起動→目標を1回タップ→WDAがホーム画面へ移動し、約90秒Probeを背景にしたまま接続・画面取得を確認→自動でこの画面に戻ります。")
+                        Text("試験中はiPhoneに触らずに待ってください（約3〜4分）。戻らない場合は手でこのアプリを開いてください。")
+                        Toggle("背景維持（無音オーディオ）", isOn: $keepAlive)
+                        if !audioNote.isEmpty { Text(audioNote).font(.footnote) }
                     }
                     Section("接続設定") {
                         TextField("VPNの接続先IP", text: $host)
@@ -57,7 +105,7 @@ struct ProbeView: View {
                         Text(hasPairing ? "Remote Pairing情報を確認済み（端末内のみ）" : "Remote Pairing情報が未設定、または形式が不正です")
                     }.disabled(running)
                     Section("試験") {
-                        Button("WDA起動・タップ試験を開始") { start() }
+                        Button("背景維持試験を開始") { start() }
                             .disabled(running || !hasPairing || runner.isEmpty)
                         Button("停止", role: .destructive) { probe_stop() }.disabled(!running)
                         Text(status).textSelection(.enabled)
@@ -74,14 +122,21 @@ struct ProbeView: View {
                 probe_free_string(text)
                 if !value.isEmpty { status = value }
             }
-            if !running { endBackgroundTask() }
+            if !running {
+                endBackgroundTask()
+                if SilentAudio.shared.active { SilentAudio.shared.stop(); audioNote = "無音オーディオ停止" }
+            }
         }
         .onChange(of: phase) { newPhase in
             if newPhase == .background && running {
                 lifecycle = "バックグラウンド移行: \(Date().formatted(date: .omitted, time: .standard))"
                 backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "BoundedProbe") {
-                    probe_stop()
-                    lifecycle = "バックグラウンド猶予切れで停止要求"
+                    if SilentAudio.shared.active {
+                        lifecycle = "背景猶予は終了（無音オーディオで継続中）"
+                    } else {
+                        probe_stop()
+                        lifecycle = "バックグラウンド猶予切れで停止要求"
+                    }
                     endBackgroundTask()
                 }
             } else if newPhase == .active {
@@ -134,7 +189,11 @@ struct ProbeView: View {
             h.withCString { hp in r.withCString { rp in selfBundle.withCString { sp in probe_start(p, hp, rp, sp) } } }
         }
         running = ok
-        if ok { wdaTaps = 0 } else { status = "試験を開始できませんでした" }
+        if ok {
+            wdaTaps = 0
+            if keepAlive { audioNote = SilentAudio.shared.start() ? "無音オーディオ再生中" : "無音オーディオを開始できません" }
+            else { audioNote = "背景維持なし（猶予のみ）" }
+        } else { status = "試験を開始できませんでした" }
     }
     private func endBackgroundTask() {
         if backgroundTask != .invalid {
