@@ -7,6 +7,7 @@
 //  - エージェントモード: WDAを起動して対象アプリを前面にし、
 //    端末内MJPEGで最新画面を保持しながら、Swiftからの操作コマンドを実行する
 mod capture;
+mod diagnostics;
 mod tunnel;
 mod wda;
 
@@ -43,6 +44,7 @@ struct Config {
     documents: String,
     /// Upper limit of one agent session.
     seconds: u64,
+    diagnostic: bool,
 }
 
 pub(crate) fn status(value: &str) {
@@ -62,10 +64,16 @@ pub(crate) fn safe_error(stage: &str, error: IdeviceError) -> String {
 
 pub(crate) async fn step<T>(label: &str, seconds: u64, task: impl Future<Output = Result<T, IdeviceError>>) -> Result<T, String> {
     status(label);
-    tokio::time::timeout(Duration::from_secs(seconds), task)
+    diagnostics::record(label, "running", "確認中");
+    let result = tokio::time::timeout(Duration::from_secs(seconds), task)
         .await
-        .map_err(|_| format!("{label}: タイムアウト（{seconds}秒）"))?
-        .map_err(|e| safe_error(label, e))
+        .map_err(|_| format!("{label}: タイムアウト（{seconds}秒）"))
+        .and_then(|r| r.map_err(|e| safe_error(label, e)));
+    match &result {
+        Ok(_) => diagnostics::record(label, "passed", "確認できました"),
+        Err(e) => diagnostics::record(label, "failed", e),
+    }
+    result
 }
 
 fn stopped() -> bool {
@@ -191,6 +199,9 @@ async fn service(t: &tunnel::Tunnel, cfg: &Config, mut rx: mpsc::UnboundedReceiv
 async fn probe(path: String, host: String, runner: String, cfg: Config) -> Result<String, String> {
     let addr = host.parse::<std::net::IpAddr>().map_err(|_| "接続先IPアドレスが不正です".to_string())?;
     let mut t = tunnel::open(path, addr).await?;
+    if cfg.diagnostic {
+        return diagnostics::run(t, &runner).await;
+    }
     if cfg.target.is_empty() {
         return list_apps(t, PathBuf::from(&cfg.documents)).await;
     }
@@ -224,7 +235,7 @@ pub unsafe extern "C" fn probe_configure(target: *const c_char, documents: *cons
     let (Ok(target), Ok(documents)) = (read(target), read(documents)) else { return false };
     let seconds = (seconds as u64).clamp(30, 7200);
     if let Ok(mut c) = CONFIG.lock() {
-        *c = Some(Config { target, documents, seconds });
+        *c = Some(Config { target, documents, seconds, diagnostic: false });
         return true;
     }
     false
@@ -251,6 +262,7 @@ pub unsafe extern "C" fn probe_start(path: *const c_char, host: *const c_char, r
     };
     STOP.store(false, Ordering::SeqCst);
     READY.store(false, Ordering::SeqCst);
+    diagnostics::reset(cfg.diagnostic);
     if let Ok(mut f) = FRAME.lock() {
         *f = None;
     }
@@ -274,18 +286,41 @@ pub unsafe extern "C" fn probe_start(path: *const c_char, host: *const c_char, r
             *c = None;
         }
         match result {
-            Ok(Ok(message)) => status(&message),
-            Ok(Err(e)) => status(&e),
-            Err(_) => status("内部エラーで停止しました"),
+            Ok(Ok(message)) => {
+                diagnostics::finish(if stopped() { "cancelled" } else { "passed" }, &message);
+                status(&message);
+            }
+            Ok(Err(e)) => { diagnostics::finish("failed", &e); status(&e); }
+            Err(_) => {
+                diagnostics::finish("failed", "内部エラーで停止しました");
+                status("内部エラーで停止しました");
+            }
         }
         RUNNING.store(false, Ordering::SeqCst);
     });
     if spawned.is_err() {
         RUNNING.store(false, Ordering::SeqCst);
+        diagnostics::finish("failed", "処理を開始できません");
         status("処理を開始できません");
         return false;
     }
     true
+}
+
+/// Select bounded diagnostics after configure and before start.
+#[unsafe(no_mangle)]
+pub extern "C" fn probe_enable_diagnostics() -> bool {
+    if RUNNING.load(Ordering::SeqCst) { return false; }
+    if let Ok(mut config) = CONFIG.lock() {
+        if let Some(c) = config.as_mut() { c.diagnostic = true; c.seconds = 60; return true; }
+    }
+    false
+}
+
+/// Caller frees with probe_free_string. Contains no raw pairing/service data.
+#[unsafe(no_mangle)]
+pub extern "C" fn probe_diagnostics() -> *mut c_char {
+    CString::new(diagnostics::snapshot()).unwrap_or_default().into_raw()
 }
 
 /// True while WDA is up, the target app was brought to the front and frames

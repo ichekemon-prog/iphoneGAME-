@@ -6,6 +6,8 @@ bool probe_start(const char *path, const char *host, const char *runner, const c
 void probe_stop(void);
 bool probe_running(void);
 char *probe_status(void);
+bool probe_enable_diagnostics(void);
+char *probe_diagnostics(void);
 void probe_free_string(char *p);
 bool agent_ready(void);
 uint64_t agent_frame_seq(void);

@@ -68,6 +68,7 @@ struct ProbeView: View {
     @State private var importing = false
     @State private var status = "診断版8: AIエージェント"
     @State private var running = false
+    @State private var connectionReport = ConnectionReport.empty
     @State private var hasPairing = false
     @State private var audioNote = ""
     @State private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
@@ -79,6 +80,13 @@ struct ProbeView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("接続診断（AIを呼び出さない）") {
+                    Text("認証 → 接続先への到達 → トンネル → 開発用サービス → WDA → 画像受信を確認します。WDA起動時に画面が切り替わる場合があります。")
+                        .font(.footnote)
+                    Button("接続を診断する") { startDiagnostics() }
+                        .disabled(running || agent.active)
+                    ConnectionDiagnosticsView(report: connectionReport)
+                }
                 Section("指示") {
                     TextField("例: 今いる画面から、イベントのステージを1回クリアして", text: $instruction, axis: .vertical)
                         .lineLimit(2...6)
@@ -133,6 +141,7 @@ struct ProbeView: View {
         .onAppear { refreshPairing(); agent.probeInFront = true }
         .onReceive(timer) { _ in
             running = probe_running()
+            connectionReport = ConnectionReport.read()
             if let text = probe_status() {
                 let value = String(cString: text)
                 probe_free_string(text)
@@ -188,7 +197,7 @@ struct ProbeView: View {
         hasPairing = isRemotePairing(plist)
     }
     @discardableResult
-    private func startService(list: Bool) -> Bool {
+    private func startService(list: Bool, diagnostic: Bool = false) -> Bool {
         let selfBundle = Bundle.main.bundleIdentifier ?? ""
         let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let r = runner.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -196,12 +205,22 @@ struct ProbeView: View {
         let docs = documentsURL.path
         let configured = t.withCString { tp in docs.withCString { dp in probe_configure(tp, dp, 3600) } }
         guard configured else { status = "設定を渡せませんでした"; return false }
+        if diagnostic && !probe_enable_diagnostics() { status = "診断を準備できませんでした"; return false }
         let ok = pairingURL.path.withCString { p in
             h.withCString { hp in r.withCString { rp in selfBundle.withCString { sp in probe_start(p, hp, rp, sp) } } }
         }
         running = ok
         if !ok { status = "開始できませんでした" }
         return ok
+    }
+    private func startDiagnostics() {
+        guard !running && !agent.active else { return }
+        guard startService(list: true, diagnostic: true) else { return }
+        connectionReport = ConnectionReport.read()
+        // WDA may bring its runner to the foreground during the check.
+        if keepAlive {
+            audioNote = SilentAudio.shared.start() ? "無音オーディオ再生中" : "無音オーディオを開始できません"
+        }
     }
     private func startAgent() {
         guard let key = KeyStore.load() else { status = "APIキーがありません"; hasKey = false; return }
