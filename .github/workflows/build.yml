@@ -20,6 +20,9 @@ jobs:
           git -C vendor/idevice checkout d32c8189c51c2789496b0768039419c3705498c3
           git -C vendor/idevice apply ../../patches/idevice-run-over-rsd.patch
           git -C vendor/idevice diff --stat
+      - name: Test diagnostic reporting
+        working-directory: core
+        run: cargo +stable test diagnostics::tests -- --test-threads=1
       - name: Build Rust core
         working-directory: core
         run: cargo +stable build --release --target aarch64-apple-ios
