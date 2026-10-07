@@ -116,9 +116,9 @@ struct ProbeView: View {
             SetupItem(id: "ddi", title: "開発用ディスクイメージ", state: ddiReady ? state(of: "DDI") : .ng,
                       next: ddiReady ? "「接続を診断する」で自動的に準備されます。"
                                      : "「開発用ディスクイメージを準備」を押してください（Wi-Fi推奨・約16MB）。"),
-            SetupItem(id: "wda", title: "WDA（操作用の部品）", state: runner.isEmpty ? (state(of: "W0") == .ng ? .ng : .unknown) : state(of: "WDA"),
+            SetupItem(id: "wda", title: "WDA（導入確認）", state: state(of: "W0") == .ng || state(of: "WDA") == .ng ? .ng : state(of: "W1"),
                       next: state(of: "W0") == .ng ? "WDAが見つかりません。PCでWDAをインストールしてください。"
-                                                   : "「接続を診断する」を押すと自動で見つけて確認します。"),
+                                                   : "「接続を診断する」で導入情報を確認できます。起動確認は詳細欄の別テストです。"),
             SetupItem(id: "key", title: "AIのAPIキー（Gemini）", state: hasKey ? .ok : .ng,
                       next: "「AI設定」でAPIキーを貼り付けて保存してください。"),
             SetupItem(id: "app", title: "操作するアプリ", state: target.isEmpty ? .ng : .ok,
@@ -146,8 +146,12 @@ struct ProbeView: View {
                     Button(readingDiagnostics ? "接続を診断中…" : "接続を診断する") { startDiagnostics() }
                         .disabled(running || agent.active || !hasPairing)
                     DisclosureGroup("診断の詳細・接続の準備", isExpanded: $connectionDetailsExpanded) {
-                        Text("LocalDevVPNを接続してから押してください。WDA起動時に画面が切り替わったら、このアプリに戻ってください。")
+                        Text("通常の診断はWDAを起動せず、接続と導入情報を確認します。LocalDevVPNを接続してから押してください。")
                             .font(.footnote)
+                        Button("WDAの起動・画面取得をテスト") { startDiagnostics(full: true) }
+                            .disabled(running || agent.active || !hasPairing)
+                        Text("この追加テストは自動操作のテスト機能を起動します。Automation Runningの表示や画面切り替えが起こる場合があります。AI判断とタップは行いません。")
+                            .font(.caption).foregroundStyle(.secondary)
                         Text(ddiReady ? "開発用ディスクイメージ：準備済み（再起動後は診断・開始時に自動でマウント）"
                                       : "開発用ディスクイメージ：未準備（再起動後の復旧に必要）")
                             .font(.footnote)
@@ -393,7 +397,7 @@ struct ProbeView: View {
         appListNote = fetchingApps ? "取得中です。完了すると選択画面が開きます。" : status
     }
     @discardableResult
-    private func startService(list: Bool, diagnostic: Bool = false) -> Bool {
+    private func startService(list: Bool, diagnostic: Bool = false, fullDiagnostic: Bool = false) -> Bool {
         let selfBundle = Bundle.main.bundleIdentifier ?? ""
         let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let r = runner.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -402,6 +406,7 @@ struct ProbeView: View {
         let configured = t.withCString { tp in docs.withCString { dp in probe_configure(tp, dp, 3600) } }
         guard configured else { status = "設定を渡せませんでした"; return false }
         if diagnostic && !probe_enable_diagnostics() { status = "診断を準備できませんでした"; return false }
+        if fullDiagnostic && !probe_enable_wda_diagnostics() { status = "WDAテストを準備できませんでした"; return false }
         DiskImage.directory.path.withCString { probe_set_ddi_dir($0) }
         let ok = pairingURL.path.withCString { p in
             h.withCString { hp in r.withCString { rp in selfBundle.withCString { sp in probe_start(p, hp, rp, sp) } } }
@@ -428,12 +433,12 @@ struct ProbeView: View {
             ddiBusy = false
         }
     }
-    private func startDiagnostics() {
+    private func startDiagnostics(full: Bool = false) {
         guard !running && !agent.active else { return }
-        guard startService(list: true, diagnostic: true) else { return }
+        guard startService(list: true, diagnostic: true, fullDiagnostic: full) else { return }
         connectionReport = ConnectionReport.read()
-        // WDA may bring its runner to the foreground during the check.
-        if keepAlive {
+        // Only the explicit full test can bring WDA to the foreground.
+        if full && keepAlive {
             audioNote = SilentAudio.shared.start() ? "無音オーディオ再生中" : "無音オーディオを開始できません"
         }
     }

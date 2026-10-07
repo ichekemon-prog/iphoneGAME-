@@ -53,6 +53,7 @@ struct Config {
     /// Upper limit of one agent session.
     seconds: u64,
     diagnostic: bool,
+    diagnostic_wda: bool,
 }
 
 pub(crate) fn status(value: &str) {
@@ -264,7 +265,7 @@ async fn probe(path: String, host: String, runner: String, cfg: Config) -> Resul
         runner = detect_runner(&mut t).await?;
     }
     if cfg.diagnostic {
-        return diagnostics::run(t, &runner, &ddi_dir).await;
+        return diagnostics::run(t, &runner, &ddi_dir, cfg.diagnostic_wda).await;
     }
     if cfg.target.is_empty() {
         return list_apps(t, PathBuf::from(&cfg.documents)).await;
@@ -303,7 +304,7 @@ pub unsafe extern "C" fn probe_configure(target: *const c_char, documents: *cons
     let (Ok(target), Ok(documents)) = (read(target), read(documents)) else { return false };
     let seconds = (seconds as u64).clamp(30, 7200);
     if let Ok(mut c) = CONFIG.lock() {
-        *c = Some(Config { target, documents, seconds, diagnostic: false });
+        *c = Some(Config { target, documents, seconds, diagnostic: false, diagnostic_wda: false });
         return true;
     }
     false
@@ -381,6 +382,21 @@ pub extern "C" fn probe_enable_diagnostics() -> bool {
     if RUNNING.load(Ordering::SeqCst) { return false; }
     if let Ok(mut config) = CONFIG.lock() {
         if let Some(c) = config.as_mut() { c.diagnostic = true; c.seconds = 60; return true; }
+    }
+    false
+}
+
+/// Explicit opt-in: full diagnostics starts XCTest and may show system automation UI.
+#[unsafe(no_mangle)]
+pub extern "C" fn probe_enable_wda_diagnostics() -> bool {
+    if RUNNING.load(Ordering::SeqCst) { return false; }
+    if let Ok(mut config) = CONFIG.lock() {
+        if let Some(c) = config.as_mut() {
+            c.diagnostic = true;
+            c.diagnostic_wda = true;
+            c.seconds = 60;
+            return true;
+        }
     }
     false
 }

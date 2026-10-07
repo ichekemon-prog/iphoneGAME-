@@ -70,7 +70,7 @@ async fn check<T>(id: &str, seconds: u64, task: impl Future<Output = Result<T, S
     result
 }
 
-pub async fn run(mut t: tunnel::Tunnel, runner: &str, ddi_dir: &str) -> Result<String, String> {
+pub async fn run(mut t: tunnel::Tunnel, runner: &str, ddi_dir: &str, start_wda: bool) -> Result<String, String> {
     // Presence is evidence of service advertisement, not proof of a mounted DDI.
     let testmanager = crate::ddi::has_testmanager(&t.handshake);
     let instruments = t.handshake.services.keys().any(|name| name.contains("dtservicehub"));
@@ -91,6 +91,9 @@ pub async fn run(mut t: tunnel::Tunnel, runner: &str, ddi_dir: &str) -> Result<S
         return Err("WDAのBundle IDを入力してください".into());
     }
     let config = tunnel::runner_config(&mut t, runner).await?;
+    if !start_wda {
+        return Ok("接続確認完了：認証・通信経路・開発用サービス・WDA導入情報を確認。WDA起動・画面取得・操作は未実施。".to_string());
+    }
     record("WDA", "running", "XCTest起動とWDAセッションを確認中（WDA画面に切り替わる場合があります）");
     tokio::select! {
         message = tunnel::run_wda(&t, config) => {
