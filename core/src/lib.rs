@@ -62,11 +62,18 @@ pub(crate) fn status(value: &str) {
     }
 }
 
-// Only numeric error codes and OS error kinds may leave the library.
+// Error codes, OS error kinds and short device-side reasons (never keys or images).
 pub(crate) fn safe_error(stage: &str, error: IdeviceError) -> String {
     let mut detail = format!("{stage}: 失敗 code={} sub={}", error.code(), error.sub_code());
     if let IdeviceError::Socket(io) = &error {
         detail.push_str(&format!(" io={:?} os={:?}", io.kind(), io.raw_os_error()));
+    }
+    // Device-side reasons (no secrets) help tell signing problems from others.
+    if let IdeviceError::UnexpectedResponse(text) = &error {
+        if text != "unexpected response" && !text.starts_with("test runner failed to bootstrap") {
+            let short: String = text.chars().take(160).collect();
+            detail.push_str(&format!(" 詳細: {short}"));
+        }
     }
     detail
 }

@@ -138,15 +138,72 @@ pub async fn runner_config(t: &mut Tunnel, runner: &str) -> Result<TestConfig, S
     step("W1: WDAアプリ情報を取得", 20, TestConfig::from_installation_proxy(&mut install, runner, None)).await
 }
 
-struct QuietListener;
-impl XCUITestListener for QuietListener {}
+/// Remembers how far the runner got, so a failure can say where it stopped.
+#[derive(Default)]
+struct TraceListener {
+    stage: &'static str,
+    notes: Vec<String>,
+}
+
+impl TraceListener {
+    fn note(&mut self, text: &str) {
+        let short: String = text.chars().take(160).collect();
+        self.notes.push(short);
+        if self.notes.len() > 3 {
+            self.notes.remove(0);
+        }
+    }
+}
+
+impl XCUITestListener for TraceListener {
+    async fn did_begin_initializing_for_ui_testing(&mut self) -> Result<(), IdeviceError> {
+        self.stage = "UIテスト初期化開始";
+        Ok(())
+    }
+    async fn exchange_protocol_version(&mut self, _c: u64, _m: u64) -> Result<(), IdeviceError> {
+        self.stage = "ランナー接続";
+        Ok(())
+    }
+    async fn test_bundle_ready_with_protocol_version(&mut self, _p: u64, _m: u64) -> Result<(), IdeviceError> {
+        self.stage = "テストバンドル読込済み";
+        Ok(())
+    }
+    async fn test_runner_ready_with_capabilities(&mut self) -> Result<(), IdeviceError> {
+        self.stage = "ランナー準備完了";
+        Ok(())
+    }
+    async fn did_begin_executing_test_plan(&mut self) -> Result<(), IdeviceError> {
+        self.stage = "WDA実行開始";
+        Ok(())
+    }
+    async fn log_message(&mut self, message: &str) -> Result<(), IdeviceError> {
+        self.note(message);
+        Ok(())
+    }
+    async fn initialization_for_ui_testing_did_fail(&mut self, description: &str) -> Result<(), IdeviceError> {
+        self.stage = "UIテスト初期化失敗";
+        self.note(description);
+        Ok(())
+    }
+    async fn did_fail_to_bootstrap(&mut self, description: &str) -> Result<(), IdeviceError> {
+        self.stage = "ランナー起動失敗";
+        self.note(description);
+        Err(IdeviceError::UnexpectedResponse(format!("test runner failed to bootstrap: {description}")))
+    }
+}
 
 /// Runs the XCTest runner hosting WDA until it ends. Race this against the
 /// work that uses WDA: when this returns, WDA is gone.
 pub async fn run_wda(t: &Tunnel, cfg: TestConfig) -> String {
-    let mut listener = QuietListener;
-    match XCUITestService::run_over_rsd(t.handle.clone(), &t.handshake, t.ios_major, cfg, &mut listener, None).await {
+    let mut listener = TraceListener::default();
+    let mut message = match XCUITestService::run_over_rsd(t.handle.clone(), &t.handshake, t.ios_major, cfg, &mut listener, None).await {
         Ok(()) => "W2: XCTestが先に終了しました（WDAが停止）".to_string(),
         Err(e) => safe_error("W2: XCTest起動・維持", e),
+    };
+    let stage = if listener.stage.is_empty() { "ランナーからの応答なし（起動・許可の段階）" } else { listener.stage };
+    message.push_str(&format!(" / 到達: {stage}"));
+    if !listener.notes.is_empty() {
+        message.push_str(&format!(" / 内容: {}", listener.notes.join(" | ")));
     }
+    message
 }
