@@ -1,8 +1,13 @@
 name: Build unsigned iPhone probe
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "配布用にReleasesへ公開する（Tapilot.ipa と WebDriverAgent-tapilot.ipa）"
+        type: boolean
+        default: false
 permissions:
-  contents: read
+  contents: write
 jobs:
   build:
     runs-on: macos-15
@@ -55,3 +60,15 @@ jobs:
           name: PhoneRunnerProbe-unsigned
           path: PhoneRunnerProbe-unsigned.ipa
           retention-days: 7
+      - name: Publish release for the PC setup tool
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test -f setup/wda/WebDriverAgent-tapilot.ipa
+          cp PhoneRunnerProbe-unsigned.ipa Tapilot.ipa
+          cp setup/wda/WebDriverAgent-tapilot.ipa WebDriverAgent-tapilot.ipa
+          tag="tapilot-${{ github.run_number }}"
+          gh release create "$tag" Tapilot.ipa WebDriverAgent-tapilot.ipa setup/wda/LICENSE-WebDriverAgent.txt \
+            --target "${{ github.sha }}" --title "Tapilot ${{ github.run_number }}" --latest \
+            --notes "PCセットアップツール（Tapilotをセットアップ）が取得する配布物。WebDriverAgent は Appium WebDriverAgent v16.14.0 を再梱包したもの（BSD License、LICENSE-WebDriverAgent.txt）。"
