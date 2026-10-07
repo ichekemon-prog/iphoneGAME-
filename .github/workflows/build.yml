@@ -27,6 +27,11 @@ jobs:
       - name: Test diagnostic reporting
         working-directory: core
         run: cargo +stable test diagnostics::tests -- --test-threads=1
+      - name: Test Gemini response parsing
+        # No API calls or device access required.
+        run: |
+          swiftc App/AgentResponse.swift tests/AgentResponseTests.swift -o "$RUNNER_TEMP/agent-response-tests"
+          "$RUNNER_TEMP/agent-response-tests"
       - name: Test image coordinate conversion
         working-directory: core
         run: cargo +stable test coordinates::tests
