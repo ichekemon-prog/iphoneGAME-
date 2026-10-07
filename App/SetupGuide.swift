@@ -4,12 +4,22 @@ import UserNotifications
 
 // MARK: - Installed apps (filled by "アプリ一覧を取得" or by a diagnostic run)
 
-struct AppEntry: Decodable, Identifiable, Hashable {
+struct AppEntry: Codable, Identifiable, Hashable {
     let name: String
     let id: String
 }
 
 enum InstalledApps {
+    static func cached() -> [AppEntry] {
+        guard let data = UserDefaults.standard.data(forKey: "installedAppsCache") else { return [] }
+        return (try? JSONDecoder().decode([AppEntry].self, from: data)) ?? []
+    }
+
+    static func cache(_ apps: [AppEntry]) {
+        if let data = try? JSONEncoder().encode(apps) {
+            UserDefaults.standard.set(data, forKey: "installedAppsCache")
+        }
+    }
     static func read() -> [AppEntry] {
         guard let pointer = probe_apps() else { return [] }
         defer { probe_free_string(pointer) }
@@ -131,8 +141,6 @@ struct SetupChecklistView: View {
     }
 
     var body: some View {
-        let done = items.filter { $0.state == .ok }.count
-        Text("準備 \(done)/\(items.count) 完了").font(.subheadline).bold()
         ForEach(items) { item in
             VStack(alignment: .leading, spacing: 3) {
                 Text("\(mark(item.state)) \(item.title)")
@@ -163,9 +171,13 @@ struct AppPickerView: View {
                     selection = app.id
                     dismiss()
                 } label: {
-                    VStack(alignment: .leading) {
-                        Text(app.name)
-                        Text(app.id).font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        VStack(alignment: .leading) {
+                            Text(app.name)
+                            Text(app.id).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if selection == app.id { Image(systemName: "checkmark") }
                     }
                 }
             }
@@ -179,10 +191,24 @@ struct AppPickerView: View {
                 if apps.isEmpty {
                     Text("アプリ一覧がまだありません。\n「アプリ一覧を取得」を先に押してください。")
                         .multilineTextAlignment(.center).foregroundStyle(.secondary).padding()
+                } else if filtered.isEmpty {
+                    Text("一致するアプリがありません").foregroundStyle(.secondary)
                 }
             }
         }
     }
+}
+
+enum ModelChoices {
+    struct Choice: Identifiable {
+        let id: String
+        let name: String
+    }
+    static let all: [Choice] = [
+        Choice(id: "gemini-3.5-flash-lite", name: "Gemini 3.5 Flash Lite"),
+        Choice(id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash Lite"),
+        Choice(id: "gemini-3.5-flash", name: "Gemini 3.5 Flash"),
+    ]
 }
 
 // MARK: - Instruction templates (generic; app-specific know-how stays in the user's own text)

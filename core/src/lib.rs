@@ -7,6 +7,7 @@
 //  - エージェントモード: WDAを起動して対象アプリを前面にし、
 //    端末内MJPEGで最新画面を保持しながら、Swiftからの操作コマンドを実行する
 mod capture;
+mod coordinates;
 mod ddi;
 mod diagnostics;
 mod tunnel;
@@ -140,21 +141,32 @@ fn num(v: &Value, key: &str) -> Option<f64> {
 
 /// Executes one command from the agent. Coordinates are normalized 0..1000
 /// (x from the left, y from the top) and converted to screen points here.
-async fn execute(w: &wda::Wda, size: (f64, f64), command: &str) -> String {
+async fn execute(w: &wda::Wda, command: &str) -> String {
     let Ok(v) = serde_json::from_str::<Value>(command) else { return "error: JSONが不正".into() };
-    let to_pt = |nx: f64, ny: f64| ((nx.clamp(0.0, 1000.0) / 1000.0) * size.0, (ny.clamp(0.0, 1000.0) / 1000.0) * size.1);
+    let mut detail = String::new();
+    // Re-read after app activation, and again for every gesture (rotation can change it).
+    let size = if matches!(v.get("type").and_then(|t| t.as_str()), Some("tap" | "swipe")) {
+        let size = match w.window_size().await { Ok(s) => s, Err(e) => return format!("error: {e}") };
+        let (Some(width), Some(height)) = (num(&v, "image_width"), num(&v, "image_height")) else {
+            return "error: 判断画像のサイズがありません".into();
+        };
+        if let Err(e) = coordinates::check_image(width, height, size) { return format!("error: {e}"); }
+        size
+    } else { (0.0, 0.0) };
     let result = match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "tap" => match (num(&v, "x"), num(&v, "y")) {
             (Some(x), Some(y)) => {
-                let (px, py) = to_pt(x, y);
+                let (px, py) = match coordinates::point(x, y, size) { Ok(p) => p, Err(e) => return format!("error: {e}") };
+                detail = format!("送信位置({px:.0},{py:.0})pt / 画面{:.0}x{:.0}pt", size.0, size.1);
                 w.tap(px, py).await
             }
             _ => Err("tap: x/yがありません".into()),
         },
         "swipe" => match (num(&v, "x"), num(&v, "y"), num(&v, "x2"), num(&v, "y2")) {
             (Some(x), Some(y), Some(x2), Some(y2)) => {
-                let (a, b) = to_pt(x, y);
-                let (c, d) = to_pt(x2, y2);
+                let (a, b) = match coordinates::point(x, y, size) { Ok(p) => p, Err(e) => return format!("error: {e}") };
+                let (c, d) = match coordinates::point(x2, y2, size) { Ok(p) => p, Err(e) => return format!("error: {e}") };
+                detail = format!("送信位置({a:.0},{b:.0})→({c:.0},{d:.0})pt / 画面{:.0}x{:.0}pt", size.0, size.1);
                 let ms = num(&v, "ms").unwrap_or(400.0).clamp(50.0, 3000.0) as u64;
                 w.swipe(a, b, c, d, ms).await
             }
@@ -169,7 +181,7 @@ async fn execute(w: &wda::Wda, size: (f64, f64), command: &str) -> String {
         other => Err(format!("未対応のコマンド: {other}")),
     };
     match result {
-        Ok(()) => "ok".into(),
+        Ok(()) => format!("ok: WDA受理（画面進行は未確認） {detail}"),
         Err(e) => format!("error: {e}"),
     }
 }
@@ -184,9 +196,9 @@ async fn service(t: &tunnel::Tunnel, cfg: &Config, mut rx: mpsc::UnboundedReceiv
     {
         status(&format!("S1: {e}（既定のまま続行）"));
     }
-    let size = w.window_size().await?;
     status("C0: 対象アプリを前面へ");
     w.activate(&cfg.target).await?;
+    let size = w.window_size().await?;
 
     let started = tokio::time::Instant::now();
     let limit = Duration::from_secs(cfg.seconds);
@@ -221,7 +233,7 @@ async fn service(t: &tunnel::Tunnel, cfg: &Config, mut rx: mpsc::UnboundedReceiv
             cmd = rx.recv() => match cmd {
                 Some((command, reply)) => {
                     commands += 1;
-                    let _ = reply.send(execute(&w, size, &command).await);
+                    let _ = reply.send(execute(&w, &command).await);
                 }
                 None => break,
             },

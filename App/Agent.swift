@@ -74,6 +74,7 @@ struct GeminiBrain {
     指示を達成するための「次の1手」だけを決め、JSONだけを返してください。
 
     座標: 画面の左上が(0,0)、右下が(1000,1000)。xは横、yは縦。画像の縦横比に関係なくこの範囲で答えます。
+    画像全体を基準に、x=画像内の横位置/画像幅×1000、y=画像内の縦位置/画像高さ×1000で指定します。ピクセル数やiOSのポイント値をそのまま返さないでください。
     出力形式:
     {"observation":"画面の状況（短く）","thought":"判断理由（短く）","action":"tap|swipe|wait|done","x":0,"y":0,"x2":0,"y2":0,"seconds":0,"memo":""}
     - tap: x,yをタップ。ボタンや文字の中心を狙う。
@@ -85,6 +86,7 @@ struct GeminiBrain {
     - 課金・購入・有料通貨の使用、アカウントや設定の変更、外部へのリンクは絶対に押さない。その画面になったらdone。
     - 確信がないときは押さずにwaitを選ぶ。同じ操作を繰り返して画面が変わらないときは別の方法を考える。
     - 直前の操作の結果を、今の画面で確認してから次を決める。
+    - WDA受理は画面が進んだ証拠ではありません。進まない場合、ボタンの背景を含む領域を見直し、実際に押せる中心を再確認してください。
     """
 
     func decide(instruction: String, step: Int, maxSteps: Int, history: [String], memos: [String], jpeg: Data) async throws -> (Decision, Int) {
@@ -145,6 +147,7 @@ final class AgentRunner: ObservableObject {
     @Published var log: [String] = []
     @Published var active = false
     @Published var phaseText = ""
+    @Published var tapPreview: UIImage?
     /// Set by the view. While this app is in front, frames show this app, so the loop pauses.
     var probeInFront = true
     private var stopRequested = false
@@ -174,6 +177,7 @@ final class AgentRunner: ObservableObject {
         stopRequested = false
         active = true
         log = []
+        tapPreview = nil
         add("開始: \(execute ? "実行モード" : "観察のみ（操作しない）") / 最大\(maxSteps)手 / \(brain.model)")
         add("指示: \(instruction)")
         task = Task { [weak self] in
@@ -234,6 +238,9 @@ final class AgentRunner: ObservableObject {
         var step = 0
         var totalTokens = 0
         var lastCall = Date.distantPast
+        var lastTap: CGPoint?
+        var repeatedTaps = 0
+        var rateLimitRetries = 0
 
         while step < maxSteps && !stopRequested && agent_ready() {
             if probeInFront {
@@ -245,7 +252,22 @@ final class AgentRunner: ObservableObject {
             let gap = interval - Date().timeIntervalSince(lastCall)
             if gap > 0 { await pause(gap) }
             await pause(0.8) // let the last action settle
-            guard let jpeg = latestFrame() else { await pause(1); continue }
+            if stopRequested { break }
+            if probeInFront { continue }
+            // Require a newly delivered frame, rather than reusing a stalled stream.
+            let previousSequence = agent_frame_seq()
+            var frameWaits = 0
+            while agent_frame_seq() == previousSequence && frameWaits < 25 && !stopRequested {
+                await pause(0.2)
+                frameWaits += 1
+            }
+            if stopRequested { break }
+            if probeInFront { continue }
+            guard agent_frame_seq() != previousSequence,
+                  let jpeg = latestFrame(), let frame = UIImage(data: jpeg), let pixels = frame.cgImage else {
+                add("新しい画面を取得できないため停止しました。接続を確認してください")
+                break
+            }
             step += 1
             phaseText = "\(step)手目: AIが判断中"
             lastCall = Date()
@@ -256,6 +278,8 @@ final class AgentRunner: ObservableObject {
                 decision = d
                 totalTokens += tokens
             } catch BrainError.rateLimited {
+                rateLimitRetries += 1
+                if rateLimitRetries > 2 { add("利用上限が続くため停止しました。モデルと利用枠を確認してください"); break }
                 add("\(step)手目: 利用上限（429）。60秒待って再試行")
                 step -= 1
                 await pause(60)
@@ -265,6 +289,21 @@ final class AgentRunner: ObservableObject {
                 if step >= 3 && history.isEmpty { add("連続して失敗したため終了"); break }
                 await pause(5)
                 continue
+            }
+            rateLimitRetries = 0
+            if stopRequested { break }
+            if probeInFront {
+                add("アプリが前面に戻ったため、古い画面に対する判断を破棄しました")
+                continue
+            }
+            let values = decision.action == "swipe" ? [decision.x, decision.y, decision.x2, decision.y2] :
+                (decision.action == "tap" ? [decision.x, decision.y] : [])
+            guard values.allSatisfy({ value in
+                guard let value else { return false }
+                return value.isFinite && (0...1000).contains(value)
+            }), decision.seconds?.isFinite != false else {
+                add("AIの座標または待機秒数が不正なため停止しました")
+                break
             }
             try? jpeg.write(to: stepsDir.appendingPathComponent(String(format: "step_%03d.jpg", step)))
             let coords: String = {
@@ -276,6 +315,35 @@ final class AgentRunner: ObservableObject {
                 }
             }()
             add("\(step)手目 \(decision.action)\(coords)\n  見: \(decision.observation ?? "-")\n  考: \(decision.thought ?? "-")")
+            if decision.action == "tap", let x = decision.x, let y = decision.y {
+                let size = CGSize(width: CGFloat(pixels.width), height: CGFloat(pixels.height))
+                let format = UIGraphicsImageRendererFormat()
+                format.scale = 1
+                let preview = UIGraphicsImageRenderer(size: size, format: format).image { context in
+                    frame.draw(in: CGRect(origin: .zero, size: size))
+                    let center = CGPoint(x: x / 1000 * size.width, y: y / 1000 * size.height)
+                    let radius = max(12, size.width * 0.025)
+                    context.cgContext.setStrokeColor(UIColor.red.cgColor)
+                    context.cgContext.setLineWidth(max(3, size.width * 0.005))
+                    context.cgContext.strokeEllipse(in: CGRect(x: center.x - radius, y: center.y - radius,
+                                                              width: radius * 2, height: radius * 2))
+                }
+                tapPreview = preview
+                try? preview.jpegData(compressionQuality: 0.85)?.write(to: stepsDir.appendingPathComponent(String(format: "step_%03d_tap.jpg", step)))
+                if execute {
+                    let point = CGPoint(x: x, y: y)
+                    if let previous = lastTap, abs(previous.x - point.x) <= 15, abs(previous.y - point.y) <= 15 {
+                        repeatedTaps += 1
+                    } else {
+                        lastTap = point
+                        repeatedTaps = 1
+                    }
+                    if repeatedTaps > 3 {
+                        add("同じ付近へのタップが3回続いたため、4回目は送らず停止しました。赤丸の位置と実際のボタンを確認してください（画面変化の自動判定ではありません）")
+                        break
+                    }
+                }
+            }
 
             if let memo = decision.memo?.trimmingCharacters(in: .whitespacesAndNewlines), !memo.isEmpty,
                !memos.contains(memo) {
@@ -287,10 +355,14 @@ final class AgentRunner: ObservableObject {
             var result = "見送り（観察のみ）"
             switch decision.action {
             case "tap" where execute:
-                result = await command(["type": "tap", "x": decision.x ?? -1, "y": decision.y ?? -1])
+                result = await command(["type": "tap", "x": decision.x ?? -1, "y": decision.y ?? -1,
+                                        "image_width": pixels.width, "image_height": pixels.height])
             case "swipe" where execute:
                 result = await command(["type": "swipe", "x": decision.x ?? -1, "y": decision.y ?? -1,
-                                        "x2": decision.x2 ?? -1, "y2": decision.y2 ?? -1, "ms": 400])
+                                        "x2": decision.x2 ?? -1, "y2": decision.y2 ?? -1, "ms": 400,
+                                        "image_width": pixels.width, "image_height": pixels.height])
+                lastTap = nil
+                repeatedTaps = 0
             case "wait":
                 result = "待機"
                 await pause(min(max(decision.seconds ?? 2, 1), 10))
@@ -304,7 +376,8 @@ final class AgentRunner: ObservableObject {
             default:
                 result = "未対応の行動"
             }
-            if result.hasPrefix("error") { add("  結果: \(result)") }
+            add("  結果: \(result)")
+            if result.hasPrefix("error") { add("操作エラーのため停止しました"); break }
             history.append("\(step). \(decision.action)\(coords) → \(result)｜\(decision.thought ?? "")")
         }
         add("終了: \(step)手 / トークン合計 \(totalTokens)")

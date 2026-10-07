@@ -71,10 +71,15 @@ struct ProbeView: View {
     @State private var editingInstruction = false
     @State private var pickingApp = false
     @State private var apps: [AppEntry] = []
+    @State private var fetchingApps = false
+    @State private var appListNote = ""
     @FocusState private var instructionFocused: Bool
     @State private var status = "Phone Runner Probe"
     @State private var running = false
     @State private var connectionReport = ConnectionReport.empty
+    @State private var readingDiagnostics = false
+    @AppStorage("setupDetailsExpanded") private var setupDetailsExpanded = false
+    @AppStorage("connectionDetailsExpanded") private var connectionDetailsExpanded = false
     @State private var hasPairing = false
     @State private var ddiReady = DiskImage.ready
     @State private var ddiBusy = false
@@ -125,29 +130,43 @@ struct ProbeView: View {
         NavigationStack {
             Form {
                 Section("はじめに（準備の確認）") {
-                    SetupChecklistView(items: setupItems)
-                    Text(ProvisionInfo.describe(expiry)).font(.footnote)
+                    DisclosureGroup(isExpanded: $setupDetailsExpanded) {
+                        SetupChecklistView(items: setupItems)
+                        Text(ProvisionInfo.describe(expiry)).font(.footnote)
+                        Text("接続に関する項目は前回の診断結果です。現在の接続を常時監視する表示ではありません。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("準備 \(setupItems.filter { $0.state == .ok }.count)/\(setupItems.count) 確認済み")
+                            Text("接続項目は前回の診断時点").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                 }
                 Section("接続診断（AIを呼び出さない）") {
-                    Text("LocalDevVPNを接続してから押してください。WDA起動時に画面が切り替わったら、このアプリに戻ってください。")
-                        .font(.footnote)
-                    Button("接続を診断する") { startDiagnostics() }
+                    Button(readingDiagnostics ? "接続を診断中…" : "接続を診断する") { startDiagnostics() }
                         .disabled(running || agent.active || !hasPairing)
-                    Text(ddiReady ? "開発用ディスクイメージ：準備済み（再起動後は診断・開始時に自動でマウント）"
-                                  : "開発用ディスクイメージ：未準備（再起動後の復旧に必要）")
-                        .font(.footnote)
-                    Button(ddiBusy ? "取得中…" : (ddiReady ? "開発用ディスクイメージを取り直す" : "開発用ディスクイメージを準備（約16MB）")) {
-                        prepareDiskImage()
-                    }.disabled(ddiBusy || running || agent.active)
-                    if !ddiNote.isEmpty { Text(ddiNote).font(.caption) }
-                    ConnectionDiagnosticsView(report: connectionReport)
+                    DisclosureGroup("診断の詳細・接続の準備", isExpanded: $connectionDetailsExpanded) {
+                        Text("LocalDevVPNを接続してから押してください。WDA起動時に画面が切り替わったら、このアプリに戻ってください。")
+                            .font(.footnote)
+                        Text(ddiReady ? "開発用ディスクイメージ：準備済み（再起動後は診断・開始時に自動でマウント）"
+                                      : "開発用ディスクイメージ：未準備（再起動後の復旧に必要）")
+                            .font(.footnote)
+                        Button(ddiBusy ? "取得中…" : (ddiReady ? "開発用ディスクイメージを取り直す" : "開発用ディスクイメージを準備（約16MB）")) {
+                            prepareDiskImage()
+                        }.disabled(ddiBusy || running || agent.active)
+                        if !ddiNote.isEmpty { Text(ddiNote).font(.caption) }
+                        ConnectionDiagnosticsView(report: connectionReport)
+                    }
                 }
                 Section("操作するアプリ") {
                     Text(target.isEmpty ? "未選択" : (targetName.isEmpty ? target : targetName))
-                    Button("操作するアプリを選ぶ") { apps = InstalledApps.targets(InstalledApps.read()); pickingApp = true }
+                    Button(apps.isEmpty ? "アプリを取得して選ぶ" : "操作するアプリを選ぶ") {
+                        if apps.isEmpty { fetchApps() } else { pickingApp = true }
+                    }
                         .disabled(running || agent.active)
-                    Button("アプリ一覧を取得（VPN接続中に）") { startService(list: true) }
+                    Button(fetchingApps ? "アプリ一覧を取得中…" : "アプリ一覧を更新（VPN接続中に）") { fetchApps() }
                         .disabled(running || agent.active || !hasPairing)
+                    if !appListNote.isEmpty { Text(appListNote).font(.footnote) }
                 }
                 Section("指示") {
                     TextField("例: 今の画面から、ステージを1回クリアして", text: $instruction, axis: .vertical)
@@ -171,6 +190,8 @@ struct ProbeView: View {
                     Toggle("実際に操作する（OFF=見て考えるだけ）", isOn: $execute)
                     Stepper("最大 \(maxSteps) 手", value: $maxSteps, in: 1...200)
                     Stepper("AIに聞く間隔 \(Int(interval)) 秒以上", value: $interval, in: 2...60, step: 1)
+                    Text("検証用：同じ付近へのタップは3回まで。4回目の前に停止して位置を確認します。")
+                        .font(.caption).foregroundStyle(.secondary)
                     Button(agent.active || running ? "エージェント実行中…" : "エージェント開始") { startAgent() }
                         .disabled(agent.active || running || !hasPairing || !hasKey || target.isEmpty || instruction.isEmpty)
                     Button("停止", role: .destructive) { agent.stop(); probe_stop() }
@@ -178,6 +199,13 @@ struct ProbeView: View {
                     if !agent.phaseText.isEmpty { Text(agent.phaseText).font(.footnote) }
                 }
                 Section("AIの判断ログ（新しい順）") {
+                    if let preview = agent.tapPreview {
+                        DisclosureGroup("最後にAIが狙ったタップ位置") {
+                            Image(uiImage: preview).resizable().scaledToFit()
+                            Text("赤い印はAIの指定位置です。実機が認識した接触位置の記録ではありません。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                     if agent.log.isEmpty { Text("まだありません").foregroundStyle(.secondary) }
                     ForEach(Array(agent.log.reversed().prefix(40).enumerated()), id: \.offset) { _, line in
                         Text(line).font(.footnote).textSelection(.enabled)
@@ -186,6 +214,16 @@ struct ProbeView: View {
                         .disabled(agent.active)
                 }
                 Section("AI設定（Gemini）") {
+                    Picker("AIモデル", selection: $model) {
+                        ForEach(ModelChoices.all, id: \.id) { choice in
+                            Text(choice.name).tag(choice.id)
+                        }
+                        if !ModelChoices.all.contains(where: { $0.id == model }) {
+                            Text("カスタム：\(model)").tag(model)
+                        }
+                    }.pickerStyle(.menu)
+                    Text("無料枠はモデル・アカウントで異なります。AI Studioの上限を確認してください。")
+                        .font(.caption).foregroundStyle(.secondary)
                     SecureField(hasKey ? "APIキー保存済み（変更する場合のみ入力）" : "APIキーを貼り付け", text: $keyInput)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                     Button("APIキーを保存して確認") { saveKey() }.disabled(keyInput.isEmpty)
@@ -230,9 +268,12 @@ struct ProbeView: View {
             AppPickerView(apps: apps, selection: $target)
         }
         .onChange(of: target) { newValue in
-            targetName = InstalledApps.read().first { $0.id == newValue }?.name ?? ""
+            targetName = apps.first { $0.id == newValue }?.name ?? ""
         }
+        .onChange(of: model) { _ in keyNote = "モデルを変更しました。次回の開始から適用します。" }
+        .onChange(of: host) { _ in connectionReport = .empty }
         .onAppear {
+            apps = InstalledApps.targets(InstalledApps.cached())
             refreshPairing()
             agent.probeInFront = true
             Notifier.requestPermission()
@@ -242,16 +283,37 @@ struct ProbeView: View {
         .onReceive(timer) { _ in
             let wasRunning = running
             running = probe_running()
-            connectionReport = ConnectionReport.read()
+            // Only a diagnostic run may replace the previous diagnostic report.
+            // Listing apps/normal startup resets the Rust transient report to idle.
+            if readingDiagnostics { connectionReport = ConnectionReport.read() }
             if let text = probe_status() {
                 let value = String(cString: text)
                 probe_free_string(text)
                 if !value.isEmpty { status = value }
             }
             if wasRunning && !running {
+                if readingDiagnostics {
+                    readingDiagnostics = false
+                    if connectionReport.state == "failed" || connectionReport.state == "warning" {
+                        connectionDetailsExpanded = true
+                    }
+                }
                 // A list/diagnostic run may have found WDA automatically.
                 let detected = InstalledApps.detectedRunner()
                 if runner.isEmpty && !detected.isEmpty { runner = detected }
+                if fetchingApps {
+                    fetchingApps = false
+                    if status.hasPrefix("アプリ一覧（") {
+                        let fetched = InstalledApps.read()
+                        InstalledApps.cache(fetched)
+                        apps = InstalledApps.targets(fetched)
+                        targetName = apps.first { $0.id == target }?.name ?? ""
+                        appListNote = "\(apps.count)件取得しました。アプリ名をタップして選んでください。"
+                        pickingApp = true
+                    } else {
+                        appListNote = "取得できませんでした：\(status)"
+                    }
+                }
             }
             if !running && !agent.active {
                 endBackgroundTask()
@@ -292,6 +354,7 @@ struct ProbeView: View {
                 var values = URLResourceValues(); values.isExcludedFromBackup = true
                 try directory.setResourceValues(values)
                 refreshPairing()
+                connectionReport = .empty
                 status = "Remote Pairing情報を保存しました"
             } catch { status = "ファイルを読み込めません。Remote Pairing形式か確認してください" }
         }
@@ -321,6 +384,14 @@ struct ProbeView: View {
             keyNote = message
         }
     }
+    private func fetchApps() {
+        guard hasPairing else {
+            appListNote = "先に詳細設定から認証ファイルを読み込んでください。"
+            return
+        }
+        fetchingApps = startService(list: true)
+        appListNote = fetchingApps ? "取得中です。完了すると選択画面が開きます。" : status
+    }
     @discardableResult
     private func startService(list: Bool, diagnostic: Bool = false) -> Bool {
         let selfBundle = Bundle.main.bundleIdentifier ?? ""
@@ -336,6 +407,10 @@ struct ProbeView: View {
             h.withCString { hp in r.withCString { rp in selfBundle.withCString { sp in probe_start(p, hp, rp, sp) } } }
         }
         running = ok
+        if ok && diagnostic {
+            connectionReport = .empty
+            readingDiagnostics = true
+        }
         if !ok { status = "開始できませんでした" }
         return ok
     }
