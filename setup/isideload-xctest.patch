@@ -1,0 +1,16 @@
+diff -ru a/src/sideload/sign.rs b/src/sideload/sign.rs
+--- a/src/sideload/sign.rs
++++ b/src/sideload/sign.rs
+@@ -79,6 +79,12 @@
+     let mut settings = BundleSigningSettings::new(&team.team_id, entitlements, Some(&signer));
+     settings.embedded_mobileprovision = Some(main_provisioning_profile.encoded_profile.as_ref());
+ 
++    // Phone Runner Probe: an XCTest bundle is loaded with dlopen into the
++    // runner. iOS rejects such a library when it carries restricted
++    // entitlements ("code signature invalid"), so sign .xctest bundles like
++    // Xcode does: no entitlements and no embedded provisioning profile.
++    all_profiles.retain(|(bundle_id, _, _)| !bundle_id.ends_with(".xctest"));
++
+     settings.embedded_mobileprovisions_by_bundle_id = all_profiles
+         .iter()
+         .map(|(bundle_id, data, _)| (bundle_id.clone(), data.encoded_profile.as_ref()))

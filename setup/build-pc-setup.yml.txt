@@ -1,0 +1,59 @@
+name: Build PC setup tool (Windows, verification only)
+# Local verification build of iloader (MIT) with Phone Runner Probe added to
+# its pairing-file placement list. Not for redistribution: iloader's name and
+# branding are covered by LICENSE-BRANDING, not by the MIT license.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      ILOADER_COMMIT: 80142ff82fc3dfa7312d77ea6151b4d20090151b
+      PAIRING_RS_SHA256: 6779bbe5c6d59f2c66da6d971791257fc1352d60c1c08b7360161c0828cde18f
+      ISIDELOAD_CRATE_SHA256: 85ceefdb91380923dae69895ae22c2152129fc2d5b95eb7f9c66c5980ff3761d
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned iloader and apply the Phone Runner patch
+        shell: bash
+        run: |
+          git -c core.autocrlf=false clone https://github.com/nab138/iloader pc-setup/iloader
+          git -C pc-setup/iloader -c core.autocrlf=false checkout "$ILOADER_COMMIT"
+          cd pc-setup/iloader
+          echo "$PAIRING_RS_SHA256  src-tauri/src/pairing.rs" | sha256sum -c -
+          sed 's/\r$//' ../../setup/iloader-phone-runner.patch > "$RUNNER_TEMP/phone-runner.patch"
+          git apply "$RUNNER_TEMP/phone-runner.patch"
+          grep -n 'phone-runner-pairing.plist' src-tauri/src/pairing.rs
+      - name: Patch isideload so .xctest bundles are signed without entitlements
+        shell: bash
+        run: |
+          cd pc-setup/iloader/src-tauri
+          curl -fsSL -o "$RUNNER_TEMP/isideload.crate" https://static.crates.io/crates/isideload/isideload-0.4.4.crate
+          echo "$ISIDELOAD_CRATE_SHA256  $RUNNER_TEMP/isideload.crate" | sha256sum -c -
+          mkdir isideload-patched
+          tar xzf "$RUNNER_TEMP/isideload.crate" --strip-components=1 -C isideload-patched
+          sed 's/\r$//' ../../../setup/isideload-xctest.patch > "$RUNNER_TEMP/isideload-xctest.patch"
+          (cd isideload-patched && patch -p1 < "$RUNNER_TEMP/isideload-xctest.patch")
+          printf '\n[patch.crates-io]\nisideload = { path = "isideload-patched" }\n' >> Cargo.toml
+          grep -n 'xctest' isideload-patched/src/sideload/sign.rs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install Perl and Make
+        run: choco install strawberryperl make --no-progress
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Build (NSIS installer and plain exe)
+        working-directory: pc-setup/iloader
+        run: |
+          bun i --frozen-lockfile
+          bunx tauri build --bundles nsis --config src-tauri/ci.conf.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhoneRunner-PCSetup-windows
+          path: |
+            pc-setup/iloader/src-tauri/target/release/iloader.exe
+            pc-setup/iloader/src-tauri/target/release/bundle/nsis/*.exe
+          retention-days: 7
