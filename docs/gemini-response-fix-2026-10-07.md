@@ -33,3 +33,11 @@
 App/Agent.swift、App/AgentResponse.swift、tests/AgentResponseTests.swift、.github/workflows/build.ymlを同時反映する。
 Actions成功後に本体IPAを従来のiloaderで更新。保存設定やBundle IDは変更しない。
 最初は3.1 Flash Lite、最大1手、操作OFFで判断が読み取れるか確認。その後、少数手で実操作を確認する。
+
+## 15:31の追加結果と修正
+- 1手目は座標欠落または範囲外で拒否。前回のスキーマではactionのみ必須で、座標は省略可能だった。欠落か範囲外かはログ上区別できない。
+- 2手目は正常デコード→WDA受理まで成功。形式修正後に操作まで進む実機実績あり。
+- 3・4手目はURLSessionのタイムアウト。サーバー応答遅延・通信のどちらが原因か未特定。モデル能力不足の証明ではない。
+- 座標x/y/x2/y2とsecondsをrequiredに追加し、未使用の値は0にする指示へ統一。アプリ側で欠落座標を0に補完して実行する変更ではない。
+- 変更はApp/Agent.swift、App/AgentResponse.swiftのみ。配布差分：いま使うファイル/Tapilot_3.1座標必須修正/App。
+- この追加変更のビルド・実機確認は未実施。タイムアウトの原因・実際の判断品質は引き続き未確定。

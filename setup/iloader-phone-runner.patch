@@ -1,9 +1,568 @@
+diff --git a/src-tauri/Cargo.toml b/src-tauri/Cargo.toml
+index b791ae7..c06fcb8 100644
+--- a/src-tauri/Cargo.toml
++++ b/src-tauri/Cargo.toml
+@@ -22,7 +22,7 @@ tauri = { version = "2", features = ["devtools"] }
+ tauri-plugin-opener = "2"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+-idevice = { version = "0.1.68", features = ["usbmuxd", "house_arrest", "afc", "core_device_proxy", "remote_pairing", "tcp", "tunnel_tcp_stack", "xpc", "rsd", "pair"] }
++idevice = { version = "0.1.68", features = ["usbmuxd", "house_arrest", "afc", "core_device_proxy", "remote_pairing", "tcp", "tunnel_tcp_stack", "xpc", "rsd", "pair", "amfi", "misagent"] }
+ isideload = { version = "0.4.4", features = ["fs-storage"] } #, path = "../../isideload/isideload" } #, git = "https://github.com/nab138/isideload", package = "isideload", branch = "apple-codesign-quick" }
+ keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native-sync-persistent"] }
+ tauri-plugin-store = "2"
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index b217fe9..87c8b5c 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -8,6 +8,7 @@ mod sideload;
+ mod pairing;
+ #[macro_use]
+ mod secure_storage;
++mod tapilot;
+ mod error;
+ mod logging;
+ mod operation;
+@@ -26,6 +27,7 @@ use crate::{
+     },
+     secure_storage::{force_disable_keyring, keyring_available},
+     sideload::{SideloaderMutex, install_sidestore_operation, sideload_operation},
++    tapilot::tapilot_setup_operation,
+ };
+ use tauri::Manager;
+ use tracing_subscriber::{Layer, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+@@ -126,6 +128,7 @@ pub fn run() {
+             force_disable_keyring,
+             cancel_pairing,
+             has_stored_rppairing,
++            tapilot_setup_operation,
+         ])
+         .run(tauri::generate_context!())
+         .expect("error while running tauri application");
 diff --git a/src-tauri/src/pairing.rs b/src-tauri/src/pairing.rs
+index 6d6c66b..3dd1e1f 100644
 --- a/src-tauri/src/pairing.rs
 +++ b/src-tauri/src/pairing.rs
-@@ -33,2 +33,5 @@
+@@ -35,6 +35,9 @@ struct PairingStorageEntry {
+ static PAIRING_STORAGE: OnceLock<Mutex<PairingStorageEntry>> = OnceLock::new();
+ 
  const PAIRING_APPS: &[(&str, &str)] = &[
 +    ("PhoneRunnerProbe", "phone-runner-pairing.plist"),
 +    ("Phone Runner Probe", "phone-runner-pairing.plist"),
 +    ("Tapilot", "phone-runner-pairing.plist"),
      ("SideStore", "ALTPairingFile.mobiledevicepairing"),
+     (
+         "LiveContainer",
+diff --git a/src-tauri/src/tapilot.rs b/src-tauri/src/tapilot.rs
+new file mode 100644
+index 0000000..9baf5ce
+--- /dev/null
++++ b/src-tauri/src/tapilot.rs
+@@ -0,0 +1,345 @@
++//! Tapilot one-button setup (added by the Phone Runner Probe patch).
++//!
++//! Steps, each reported to the frontend as an operation step:
++//! 1. devmode  - show the Developer Mode switch in Settings (AMFI, best effort)
++//! 2. download - SideStore, Tapilot and the repackaged WebDriverAgent
++//! 3. sidestore - install SideStore and place its pairing file
++//! 4. tapilot  - install Tapilot and place its pairing file
++//! 5. wda      - install WebDriverAgent (test bundle under Frameworks/)
++//! 6. files    - copy the two IPAs into Tapilot's Documents so the user can
++//!    add them to SideStore from the Files app (SideStore refreshes them later)
++//! 7. trust    - trust the developer profiles on the device (AMFI, best effort)
++
++use std::path::PathBuf;
++
++use idevice::{
++    IdeviceService, amfi::AmfiClient, house_arrest::HouseArrestClient,
++    installation_proxy::InstallationProxyClient, misagent::MisagentClient,
++};
++use tauri::{AppHandle, Manager, State, Window};
++
++use crate::{
++    device::{DeviceInfoMutex, DeviceInfoWithPairing, get_provider},
++    error::AppError,
++    operation::Operation,
++    pairing::{get_sidestore_info, place_file},
++    sideload::{SideloaderMutex, download, sideload},
++};
++
++const SIDESTORE_URL: &str =
++    "https://github.com/SideStore/SideStore/releases/latest/download/SideStore.ipa";
++const TAPILOT_URL: &str =
++    "https://github.com/ichekemon-prog/iphoneGAME-/releases/latest/download/Tapilot.ipa";
++const WDA_URL: &str = "https://github.com/ichekemon-prog/iphoneGAME-/releases/latest/download/WebDriverAgent-tapilot.ipa";
++
++/// Where Tapilot looks for a pairing file delivered from the PC.
++const TAPILOT_PAIRING_PATH: &str = "phone-runner-pairing.plist";
++/// Folder inside Tapilot's Documents (visible in the Files app).
++const IPA_FOLDER: &str = "SideStore用";
++
++fn current_device(state: &State<'_, DeviceInfoMutex>) -> Result<DeviceInfoWithPairing, AppError> {
++    let guard = state.lock().unwrap();
++    guard.clone().ok_or(AppError::NoDeviceSelected)
++}
++
++fn coms(context: &str, e: impl ToString) -> AppError {
++    AppError::DeviceComsWithMessage(context.into(), e.to_string())
++}
++
++/// Shows the Developer Mode switch (Settings > Privacy & Security) when it is off.
++/// Returns Some(true) if already on, Some(false) if revealed, None if unknown.
++async fn prepare_developer_mode(device: &DeviceInfoWithPairing) -> Option<bool> {
++    let provider = get_provider(&device.info).await.ok()?;
++    let mut amfi = match AmfiClient::connect(&provider).await {
++        Ok(a) => a,
++        Err(e) => {
++            tracing::warn!("AMFI connect failed: {e}");
++            return None;
++        }
++    };
++    match amfi.get_developer_mode_status().await {
++        Ok(true) => Some(true),
++        Ok(false) => {
++            if let Err(e) = amfi.reveal_developer_mode_option_in_ui().await {
++                tracing::warn!("Failed to reveal Developer Mode option: {e}");
++            }
++            Some(false)
++        }
++        Err(e) => {
++            tracing::warn!("Developer Mode status unknown: {e}");
++            None
++        }
++    }
++}
++
++/// Finds an installed user app by display name, or by bundle id prefix.
++async fn find_app(
++    device: &DeviceInfoWithPairing,
++    names: &[&str],
++    id_prefix: &str,
++) -> Result<Option<String>, AppError> {
++    let provider = get_provider(&device.info).await?;
++    let mut proxy = InstallationProxyClient::connect(&provider)
++        .await
++        .map_err(|e| coms("Failed to connect to installation proxy", e))?;
++    let apps = proxy
++        .get_apps(Some("User"), None)
++        .await
++        .map_err(|e| coms("Failed to get installed apps", e))?;
++    for (bundle_id, app) in apps {
++        let name = app
++            .as_dictionary()
++            .and_then(|d| d.get("CFBundleDisplayName"))
++            .and_then(|v| v.as_string())
++            .unwrap_or("");
++        if names.contains(&name) || bundle_id.starts_with(id_prefix) {
++            return Ok(Some(bundle_id));
++        }
++    }
++    Ok(None)
++}
++
++/// Copies a local file into an app's Documents folder over AFC.
++async fn copy_to_documents(
++    device: &DeviceInfoWithPairing,
++    bundle_id: &str,
++    folder: &str,
++    file: &PathBuf,
++    name: &str,
++) -> Result<(), AppError> {
++    let data = tokio::fs::read(file)
++        .await
++        .map_err(|e| AppError::Filesystem("Failed to read IPA".into(), e.to_string()))?;
++    let provider = get_provider(&device.info).await?;
++    let house_arrest = HouseArrestClient::connect(&provider)
++        .await
++        .map_err(|e| AppError::HouseArrest("Failed to connect to house arrest".into(), e.to_string()))?;
++    let mut afc = house_arrest
++        .vend_documents(bundle_id.to_string())
++        .await
++        .map_err(|e| AppError::HouseArrest("Failed to vend documents".into(), e.to_string()))?;
++    afc.mk_dir(format!("/Documents/{folder}"))
++        .await
++        .map_err(|e| AppError::HouseArrest("Failed to create folder".into(), e.to_string()))?;
++    let mut handle = afc
++        .open(
++            format!("/Documents/{folder}/{name}"),
++            idevice::afc::opcode::AfcFopenMode::Wr,
++        )
++        .await
++        .map_err(|e| AppError::HouseArrest("Failed to open file on device".into(), e.to_string()))?;
++    handle
++        .write_entire(&data)
++        .await
++        .map_err(|e| AppError::HouseArrest("Failed to write file".into(), e.to_string()))?;
++    handle
++        .close()
++        .await
++        .map_err(|e| AppError::HouseArrest("Failed to close file".into(), e.to_string()))?;
++    Ok(())
++}
++
++/// Reads the UUID of a provisioning profile (CMS-wrapped plist).
++fn profile_uuid(data: &[u8]) -> Option<String> {
++    let start = data.windows(5).position(|w| w == b"<?xml")?;
++    let end_tag = b"</plist>";
++    let end = data[start..]
++        .windows(end_tag.len())
++        .position(|w| w == end_tag)?
++        + start
++        + end_tag.len();
++    let value = plist::Value::from_reader_xml(&data[start..end]).ok()?;
++    value
++        .as_dictionary()?
++        .get("UUID")?
++        .as_string()
++        .map(str::to_owned)
++}
++
++/// Marks the installed developer profiles as trusted, like tapping "Trust" in
++/// Settings > General > VPN & Device Management. Best effort.
++async fn trust_profiles(device: &DeviceInfoWithPairing) -> usize {
++    let Ok(provider) = get_provider(&device.info).await else {
++        return 0;
++    };
++    let profiles = match MisagentClient::connect(&provider).await {
++        Ok(mut m) => m.copy_all().await.unwrap_or_default(),
++        Err(e) => {
++            tracing::warn!("misagent connect failed: {e}");
++            return 0;
++        }
++    };
++    let Ok(mut amfi) = AmfiClient::connect(&provider).await else {
++        return 0;
++    };
++    let mut trusted = 0;
++    for uuid in profiles.iter().filter_map(|p| profile_uuid(p)) {
++        match amfi.trust_app_signer(uuid.clone()).await {
++            Ok(true) => trusted += 1,
++            Ok(false) => tracing::info!("Profile {uuid} not trusted by AMFI"),
++            Err(e) => tracing::warn!("Trusting profile {uuid} failed: {e}"),
++        }
++    }
++    trusted
++}
++
++async fn fetch(
++    handle: &AppHandle,
++    local: Option<String>,
++    url: &str,
++    file_name: &str,
++) -> Result<PathBuf, AppError> {
++    if let Some(path) = local.filter(|p| !p.is_empty()) {
++        return Ok(PathBuf::from(path));
++    }
++    let dest = handle
++        .path()
++        .temp_dir()
++        .map_err(|e| AppError::Filesystem("Failed to get temp dir".into(), e.to_string()))?
++        .join(file_name);
++    download(url, &dest)
++        .await
++        .map_err(|e| AppError::Download(format!("{file_name}: {e}")))?;
++    Ok(dest)
++}
++
++#[tauri::command]
++pub async fn tapilot_setup_operation(
++    handle: AppHandle,
++    window: Window,
++    device_state: State<'_, DeviceInfoMutex>,
++    sideloader_state: State<'_, SideloaderMutex>,
++    tapilot_path: Option<String>,
++    wda_path: Option<String>,
++) -> Result<(), AppError> {
++    let op = Operation::new("tapilot_setup".to_string(), &window);
++    let device = match current_device(&device_state) {
++        Ok(d) => d,
++        Err(e) => return op.fail("devmode", e),
++    };
++
++    op.start("devmode")?;
++    let devmode = prepare_developer_mode(&device).await;
++    tracing::info!("Developer Mode before setup: {devmode:?}");
++
++    op.move_on("devmode", "download")?;
++    let sidestore_ipa = op.fail_if_err(
++        "download",
++        fetch(&handle, None, SIDESTORE_URL, "SideStore.ipa").await,
++    )?;
++    let tapilot_ipa = op.fail_if_err(
++        "download",
++        fetch(&handle, tapilot_path, TAPILOT_URL, "Tapilot.ipa").await,
++    )?;
++    let wda_ipa = op.fail_if_err(
++        "download",
++        fetch(&handle, wda_path, WDA_URL, "WebDriverAgent-tapilot.ipa").await,
++    )?;
++
++    op.move_on("download", "sidestore")?;
++    op.fail_if_err(
++        "sidestore",
++        sideload(
++            device_state.clone(),
++            sideloader_state.clone(),
++            sidestore_ipa.to_string_lossy().to_string(),
++        )
++        .await,
++    )?;
++    match op.fail_if_err("sidestore", get_sidestore_info(&device.info, false).await)? {
++        Some(info) => {
++            let provider = op.fail_if_err("sidestore", get_provider(&device.info).await)?;
++            op.fail_if_err(
++                "sidestore",
++                place_file(device.pairing.clone(), &provider, info.bundle_id, info.path).await,
++            )?;
++        }
++        None => {
++            return op.fail(
++                "sidestore",
++                AppError::HouseArrest(
++                    "SideStore's not found".into(),
++                    "The device did not report SideStore's bundle ID as installed".into(),
++                ),
++            );
++        }
++    }
++
++    op.move_on("sidestore", "tapilot")?;
++    op.fail_if_err(
++        "tapilot",
++        sideload(
++            device_state.clone(),
++            sideloader_state.clone(),
++            tapilot_ipa.to_string_lossy().to_string(),
++        )
++        .await,
++    )?;
++    let tapilot_id = match op.fail_if_err(
++        "tapilot",
++        find_app(
++            &device,
++            &["Tapilot", "Phone Runner Probe", "PhoneRunnerProbe"],
++            "org.local.PhoneRunnerProbe",
++        )
++        .await,
++    )? {
++        Some(id) => id,
++        None => {
++            return op.fail(
++                "tapilot",
++                AppError::HouseArrest(
++                    "Tapilot's not found".into(),
++                    "The device did not report Tapilot as installed".into(),
++                ),
++            );
++        }
++    };
++    {
++        let provider = op.fail_if_err("tapilot", get_provider(&device.info).await)?;
++        op.fail_if_err(
++            "tapilot",
++            place_file(
++                device.pairing.clone(),
++                &provider,
++                tapilot_id.clone(),
++                TAPILOT_PAIRING_PATH.to_string(),
++            )
++            .await,
++        )?;
++    }
++
++    op.move_on("tapilot", "wda")?;
++    op.fail_if_err(
++        "wda",
++        sideload(
++            device_state.clone(),
++            sideloader_state.clone(),
++            wda_ipa.to_string_lossy().to_string(),
++        )
++        .await,
++    )?;
++
++    op.move_on("wda", "files")?;
++    op.fail_if_err(
++        "files",
++        copy_to_documents(&device, &tapilot_id, IPA_FOLDER, &tapilot_ipa, "Tapilot.ipa").await,
++    )?;
++    op.fail_if_err(
++        "files",
++        copy_to_documents(
++            &device,
++            &tapilot_id,
++            IPA_FOLDER,
++            &wda_ipa,
++            "WebDriverAgent-tapilot.ipa",
++        )
++        .await,
++    )?;
++
++    op.move_on("files", "trust")?;
++    let trusted = trust_profiles(&device).await;
++    tracing::info!("Trusted {trusted} developer profile(s)");
++    op.complete("trust")?;
++    Ok(())
++}
+diff --git a/src/App.tsx b/src/App.tsx
+index 61f0916..7730b68 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -9,6 +9,7 @@ import {
+   sideloadOperation,
+   installSideStoreOperation,
+   installLiveContainerOperation,
++  tapilotSetupOperation,
+   Operation,
+   OperationState,
+   OperationUpdate,
+@@ -318,6 +319,42 @@ function App() {
+             </div>
+             <GlassCard className="panel">
+               <div className="action-row single-row">
++                <button
++                  onClick={async () => {
++                    if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
++                    try {
++                      await startOperation(tapilotSetupOperation, {});
++                    } catch (e: any) {
++                      if (e?.type !== "download") {
++                        console.error(e?.message);
++                        return;
++                      }
++                      // No release to download: let the user pick the two IPAs.
++                      const tapilotPath = await openFileDialog({
++                        title: t("app.tapilot_pick_app"),
++                        multiple: false,
++                        filters: [
++                          { name: t("app.ipa_files"), extensions: ["ipa"] },
++                        ],
++                      });
++                      if (!tapilotPath) return;
++                      const wdaPath = await openFileDialog({
++                        title: t("app.tapilot_pick_wda"),
++                        multiple: false,
++                        filters: [
++                          { name: t("app.ipa_files"), extensions: ["ipa"] },
++                        ],
++                      });
++                      if (!wdaPath) return;
++                      startOperation(tapilotSetupOperation, {
++                        tapilotPath: tapilotPath as string,
++                        wdaPath: wdaPath as string,
++                      }).catch((err) => console.error(err?.message));
++                    }
++                  }}
++                >
++                  {t("app.tapilot_setup")}
++                </button>
+                 <button
+                   onClick={() => {
+                     if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
+diff --git a/src/components/OperationView.css b/src/components/OperationView.css
+index 1199119..036f2f5 100644
+--- a/src/components/OperationView.css
++++ b/src/components/OperationView.css
+@@ -120,6 +120,8 @@
+ }
+ 
+ .operation-success-message {
++  white-space: pre-line;
++  text-align: left;
+   font-weight: 600;
+   color: rgb(241, 212, 115);
+ }
+diff --git a/src/components/operations.ts b/src/components/operations.ts
+index 3b5fdb4..6a5a009 100644
+--- a/src/components/operations.ts
++++ b/src/components/operations.ts
+@@ -88,3 +88,19 @@ export const sideloadOperation = {
+     },
+   ],
+ };
++
++export const tapilotSetupOperation: Operation = {
++  id: "tapilot_setup",
++  titleKey: "operations.tapilot_setup_title",
++  successTitleKey: "operations.tapilot_setup_success_title",
++  successMessageKey: "operations.tapilot_setup_success_message",
++  steps: [
++    { id: "devmode", titleKey: "operations.tapilot_setup_step_devmode" },
++    { id: "download", titleKey: "operations.tapilot_setup_step_download" },
++    { id: "sidestore", titleKey: "operations.tapilot_setup_step_sidestore" },
++    { id: "tapilot", titleKey: "operations.tapilot_setup_step_tapilot" },
++    { id: "wda", titleKey: "operations.tapilot_setup_step_wda" },
++    { id: "files", titleKey: "operations.tapilot_setup_step_files" },
++    { id: "trust", titleKey: "operations.tapilot_setup_step_trust" },
++  ],
++};
+diff --git a/src/locales/en.json b/src/locales/en.json
+index dfd87cd..cdd4fc3 100644
+--- a/src/locales/en.json
++++ b/src/locales/en.json
+@@ -45,7 +45,10 @@
+     "must_be_logged_in": "You must be logged in!",
+     "must_select_device": "You must select a device!",
+     "ipa_files": "IPA Files",
+-    "logo_alt": "iloader logo"
++    "logo_alt": "iloader logo",
++    "tapilot_setup": "Set up Tapilot",
++    "tapilot_pick_app": "Choose the Tapilot IPA",
++    "tapilot_pick_wda": "Choose the WebDriverAgent IPA"
+   },
+   "apple_id": {
+     "title": "Apple ID",
+@@ -116,7 +119,17 @@
+     "install_livecontainer_step_install": "Sign & Install LiveContainer+SideStore",
+     "install_livecontainer_step_pairing": "Place Pairing File",
+     "sideload_title": "Installing App",
+-    "sideload_step_install": "Sign & Install App"
++    "sideload_step_install": "Sign & Install App",
++    "tapilot_setup_title": "Setting up Tapilot",
++    "tapilot_setup_success_title": "PC setup finished",
++    "tapilot_setup_success_message": "Continue on the iPhone, in this order:\n1. Developer Mode: Settings > Privacy & Security > Developer Mode on > restart (skip if already on)\n2. Trust: Settings > General > VPN & Device Management > your Apple ID > Trust (skip if it says Verified)\n3. Install LocalDevVPN from the App Store and connect it\n4. Open SideStore and sign in with your Apple ID (if a Revoke dialog appears, press Cancel)\n5. In SideStore tap + > On My iPhone > Tapilot > SideStore用 and pick Tapilot.ipa, then WebDriverAgent-tapilot.ipa (SideStore can then refresh them every 7 days)\n6. Open Tapilot and complete the checklist from the top",
++    "tapilot_setup_step_devmode": "Showing the Developer Mode switch",
++    "tapilot_setup_step_download": "Downloading SideStore, Tapilot and WDA",
++    "tapilot_setup_step_sidestore": "Installing SideStore and placing its pairing file",
++    "tapilot_setup_step_tapilot": "Installing Tapilot and placing its pairing file",
++    "tapilot_setup_step_wda": "Installing WebDriverAgent",
++    "tapilot_setup_step_files": "Copying the IPAs for SideStore into Tapilot",
++    "tapilot_setup_step_trust": "Trusting the developer"
+   },
+   "certificates": {
+     "manage": "Manage Certificates",
+diff --git a/src/locales/ja.json b/src/locales/ja.json
+index 0f2d1e6..4b92d96 100644
+--- a/src/locales/ja.json
++++ b/src/locales/ja.json
+@@ -44,7 +44,10 @@
+     "must_be_logged_in": "ログインが必要です！",
+     "must_select_device": "デバイスを選択してください！",
+     "ipa_files": "IPAファイル",
+-    "logo_alt": "iloader ロゴ"
++    "logo_alt": "iloader ロゴ",
++    "tapilot_setup": "Tapilotをセットアップ",
++    "tapilot_pick_app": "Tapilot の IPA を選択",
++    "tapilot_pick_wda": "WebDriverAgent の IPA を選択"
+   },
+   "apple_id": {
+     "title": "Apple ID",
+@@ -115,7 +118,17 @@
+     "install_livecontainer_step_install": "LiveContainer+SideStoreを署名してインストール中",
+     "install_livecontainer_step_pairing": "ペアリングファイルを配置中",
+     "sideload_title": "アプリをインストール中",
+-    "sideload_step_install": "アプリを署名してインストール中"
++    "sideload_step_install": "アプリを署名してインストール中",
++    "tapilot_setup_title": "Tapilotをセットアップ中",
++    "tapilot_setup_success_title": "PCでのセットアップが完了しました",
++    "tapilot_setup_success_message": "続きはiPhoneで、上から順に進めてください。\n1. 開発者モード：設定 → プライバシーとセキュリティ → デベロッパモードをオン → 再起動（すでにオンなら不要）\n2. 信頼：設定 → 一般 → VPNとデバイス管理 → 自分のApple IDを開き「信頼」（「検証済み」と出ていれば不要）\n3. App Storeから「LocalDevVPN」を入れて接続する\n4. SideStoreを開いてApple IDでサインイン（「Revoke」の画面が出たら押さずにCancel）\n5. SideStoreの「＋」→「このiPhone内」→「Tapilot」→「SideStore用」から Tapilot.ipa を選ぶ。続けて WebDriverAgent-tapilot.ipa も同じように選ぶ（7日ごとの更新がSideStoreでできるようになります）\n6. Tapilotを開き、「はじめに」の項目を上から順に✅にする",
++    "tapilot_setup_step_devmode": "開発者モードの項目を表示",
++    "tapilot_setup_step_download": "SideStore・Tapilot・WDAをダウンロード中",
++    "tapilot_setup_step_sidestore": "SideStoreをインストールし、ペアリングファイルを配置中",
++    "tapilot_setup_step_tapilot": "Tapilotをインストールし、ペアリングファイルを配置中",
++    "tapilot_setup_step_wda": "WebDriverAgentをインストール中",
++    "tapilot_setup_step_files": "SideStore用のファイルをTapilotへコピー中",
++    "tapilot_setup_step_trust": "開発元を信頼済みに設定中"
+   },
+   "certificates": {
+     "manage": "証明書の管理",
