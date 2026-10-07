@@ -39,32 +39,6 @@ enum KeyStore {
 
 // MARK: - Brain (vision model). Replaceable: only `decide` is used by the loop.
 
-struct Decision: Decodable {
-    var observation: String?
-    var thought: String?
-    var action: String
-    var x: Double?
-    var y: Double?
-    var x2: Double?
-    var y2: Double?
-    var seconds: Double?
-    var memo: String?
-}
-
-enum BrainError: LocalizedError {
-    case rateLimited
-    case http(Int, String)
-    case format(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .rateLimited: return "利用上限に達しました（429）"
-        case let .http(code, message): return "HTTP \(code): \(message)"
-        case let .format(message): return "応答の形式が不正: \(message)"
-        }
-    }
-}
-
 struct GeminiBrain {
     let apiKey: String
     let model: String
@@ -76,7 +50,8 @@ struct GeminiBrain {
     座標: 画面の左上が(0,0)、右下が(1000,1000)。xは横、yは縦。画像の縦横比に関係なくこの範囲で答えます。
     画像全体を基準に、x=画像内の横位置/画像幅×1000、y=画像内の縦位置/画像高さ×1000で指定します。ピクセル数やiOSのポイント値をそのまま返さないでください。
     出力形式:
-    {"observation":"画面の状況（短く）","thought":"判断理由（短く）","action":"tap|swipe|wait|done","x":0,"y":0,"x2":0,"y2":0,"seconds":0,"memo":""}
+    {"action":"tap","x":500,"y":500,"observation":"画面の状況（短く）","thought":"判断理由（短く）","memo":""}
+    actionはtap・swipe・wait・doneのいずれか1つ。操作に必要な数値は必ず含め、不要な項目は省略できます。説明は各1文で簡潔にしてください。
     - tap: x,yをタップ。ボタンや文字の中心を狙う。
     - swipe: (x,y)から(x2,y2)へスワイプ。
     - wait: 読み込み中・演出中などで待つ。secondsに秒数（1〜10）。
@@ -89,7 +64,7 @@ struct GeminiBrain {
     - WDA受理は画面が進んだ証拠ではありません。進まない場合、ボタンの背景を含む領域を見直し、実際に押せる中心を再確認してください。
     """
 
-    func decide(instruction: String, step: Int, maxSteps: Int, history: [String], memos: [String], jpeg: Data) async throws -> (Decision, Int) {
+    func decide(instruction: String, step: Int, maxSteps: Int, history: [String], memos: [String], jpeg: Data) async throws -> (Decision, Int?) {
         var text = "指示: \(instruction)\nステップ: \(step)/\(maxSteps)\n"
         text += "直近の行動:\n" + (history.isEmpty ? "（なし）\n" : history.suffix(10).joined(separator: "\n") + "\n")
         text += "経験メモ:\n" + (memos.isEmpty ? "（なし）\n" : memos.suffix(30).map { "- \($0)" }.joined(separator: "\n") + "\n")
@@ -104,7 +79,7 @@ struct GeminiBrain {
                     ["inline_data": ["mime_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
                 ],
             ]],
-            "generationConfig": ["responseMimeType": "application/json", "temperature": 0.2],
+            "generationConfig": AgentResponse.generationConfig,
         ]
         let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(trimmed):generateContent") else {
@@ -124,19 +99,7 @@ struct GeminiBrain {
             let message = ((json?["error"] as? [String: Any])?["message"] as? String) ?? "-"
             throw BrainError.http(code, String(message.prefix(160)))
         }
-        let tokens = (json["usageMetadata"] as? [String: Any])?["totalTokenCount"] as? Int ?? 0
-        let parts = (((json["candidates"] as? [[String: Any]])?.first?["content"] as? [String: Any])?["parts"] as? [[String: Any]]) ?? []
-        guard let answer = parts.last(where: { $0["text"] != nil && ($0["thought"] as? Bool) != true })?["text"] as? String else {
-            throw BrainError.format("テキストなし")
-        }
-        var cleaned = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        if cleaned.hasPrefix("```") {
-            cleaned = cleaned.replacingOccurrences(of: "```json", with: "").replacingOccurrences(of: "```", with: "")
-        }
-        guard let decision = try? JSONDecoder().decode(Decision.self, from: Data(cleaned.utf8)) else {
-            throw BrainError.format(String(cleaned.prefix(120)))
-        }
-        return (decision, tokens)
+        return try AgentResponse.decode(json)
     }
 }
 
@@ -241,6 +204,7 @@ final class AgentRunner: ObservableObject {
         var lastTap: CGPoint?
         var repeatedTaps = 0
         var rateLimitRetries = 0
+        var consecutiveFailures = 0
 
         while step < maxSteps && !stopRequested && agent_ready() {
             if probeInFront {
@@ -276,7 +240,7 @@ final class AgentRunner: ObservableObject {
                 let (d, tokens) = try await brain.decide(instruction: instruction, step: step, maxSteps: maxSteps,
                                                         history: history, memos: memos, jpeg: jpeg)
                 decision = d
-                totalTokens += tokens
+                totalTokens += tokens ?? 0
             } catch BrainError.rateLimited {
                 rateLimitRetries += 1
                 if rateLimitRetries > 2 { add("利用上限が続くため停止しました。モデルと利用枠を確認してください"); break }
@@ -285,12 +249,17 @@ final class AgentRunner: ObservableObject {
                 await pause(60)
                 continue
             } catch {
-                add("\(step)手目: AI呼び出し失敗 \(error.localizedDescription)")
-                if step >= 3 && history.isEmpty { add("連続して失敗したため終了"); break }
+                if let failure = error as? BrainError, case let .response(_, tokens) = failure {
+                    totalTokens += tokens ?? 0
+                }
+                consecutiveFailures += 1
+                add("\(step)手目: AI判断失敗 \(error.localizedDescription)")
+                if consecutiveFailures >= 3 { add("3回連続で失敗したため終了"); break }
                 await pause(5)
                 continue
             }
             rateLimitRetries = 0
+            consecutiveFailures = 0
             if stopRequested { break }
             if probeInFront {
                 add("アプリが前面に戻ったため、古い画面に対する判断を破棄しました")
@@ -380,7 +349,7 @@ final class AgentRunner: ObservableObject {
             if result.hasPrefix("error") { add("操作エラーのため停止しました"); break }
             history.append("\(step). \(decision.action)\(coords) → \(result)｜\(decision.thought ?? "")")
         }
-        add("終了: \(step)手 / トークン合計 \(totalTokens)")
+        add("終了: \(step)手 / API報告トークン合計 \(totalTokens)（取得できた分・形式不正を含む）")
         phaseText = "終了"
     }
 }
