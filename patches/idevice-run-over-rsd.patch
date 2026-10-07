@@ -1,5 +1,5 @@
 diff --git a/idevice/src/services/dvt/xctest/mod.rs b/idevice/src/services/dvt/xctest/mod.rs
-index 3705645..eaff8ae 100644
+index 3705645..d2aa3f9 100644
 --- a/idevice/src/services/dvt/xctest/mod.rs
 +++ b/idevice/src/services/dvt/xctest/mod.rs
 @@ -655,6 +655,45 @@ async fn connect_testmanagerd_rsd(
@@ -48,7 +48,51 @@ index 3705645..eaff8ae 100644
  /// Establishes the three DTX connections required for an XCTest run.
  ///
  /// For iOS 17+ tries `CoreDeviceProxy` + RSD first. Falls back to lockdown
-@@ -2002,11 +2041,63 @@ impl XCUITestService {
+@@ -1098,6 +1137,31 @@ pub(super) async fn start_executing_test_plan<R: ReadWrite + 'static>(
+ 
+ // --- Aux-value helpers ------------------------------------------------------
+ 
++/// Phone Runner Probe: every human-readable string stored in an
++/// NSKeyedArchive (skips class names and `$null`).
++fn archive_strings(aux: &AuxValue) -> String {
++    let AuxValue::Array(bytes) = aux else {
++        return String::new();
++    };
++    let Ok(Value::Dictionary(root)) = Value::from_reader(std::io::Cursor::new(bytes)) else {
++        return String::new();
++    };
++    let Some(Value::Array(objects)) = root.get("$objects") else {
++        return String::new();
++    };
++    let skip = |s: &str| s == "$null" || s.starts_with("NS") && !s.contains(' ');
++    let parts: Vec<&str> = objects
++        .iter()
++        .filter_map(|o| o.as_string())
++        .filter(|s| !skip(s))
++        .collect();
++    if parts.is_empty() {
++        String::new()
++    } else {
++        format!(" [{}]", parts.join(" | "))
++    }
++}
++
+ fn decode_aux_archive(aux: &AuxValue) -> Result<Value, IdeviceError> {
+     match aux {
+         AuxValue::Array(bytes) => ns_keyed_archive::decode::from_bytes(bytes)
+@@ -1654,7 +1718,10 @@ pub(super) async fn dispatch_xct_message<L: XCUITestListener>(
+                                 103 => " (untrusted developer certificate — go to Settings → General → VPN & Device Management and trust your developer app)",
+                                 _ => "",
+                             };
+-                            return Some(format!("NSError code {code}{hint}"));
++                            // Phone Runner Probe: also list the archive's strings
++                            // (domain, reasons, paths) so the real cause is visible.
++                            let extra = archive_strings(v);
++                            return Some(format!("NSError code {code}{hint}{extra}"));
+                         }
+                     }
+                     None
+@@ -2002,11 +2069,63 @@ impl XCUITestService {
                  .unwrap_or(16u8)
          };
  

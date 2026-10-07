@@ -147,7 +147,7 @@ struct TraceListener {
 
 impl TraceListener {
     fn note(&mut self, text: &str) {
-        let short: String = text.chars().take(160).collect();
+        let short: String = text.chars().take(600).collect();
         self.notes.push(short);
         if self.notes.len() > 3 {
             self.notes.remove(0);
