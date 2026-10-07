@@ -135,6 +135,19 @@ pub async fn list_user_apps(t: &mut Tunnel) -> Result<Vec<(String, String)>, Str
 pub async fn runner_config(t: &mut Tunnel, runner: &str) -> Result<TestConfig, String> {
     let mut install: InstallationProxyClient =
         step("W1: アプリ一覧サービスへ接続", 20, t.handshake.connect(&mut t.handle)).await?;
+    // A repackaged runner may keep its test bundle outside PlugIns (see
+    // setup/WDA再梱包.md); it says where in the "TapilotTestBundle" key.
+    let info = step("W1: WDAの構成を確認", 20, install.get_apps(None, Some(vec![runner.to_string()]))).await?;
+    let subpath = info
+        .get(runner)
+        .and_then(|v| v.as_dictionary())
+        .and_then(|d| d.get("TapilotTestBundle"))
+        .and_then(|v| v.as_string())
+        .filter(|p| !p.is_empty() && !p.starts_with('/') && !p.contains(".."))
+        .map(str::to_owned);
+    if let Ok(mut slot) = idevice::dvt::xctest::TEST_BUNDLE_SUBPATH.lock() {
+        *slot = subpath;
+    }
     step("W1: WDAアプリ情報を取得", 20, TestConfig::from_installation_proxy(&mut install, runner, None)).await
 }
 
