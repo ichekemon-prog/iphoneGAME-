@@ -15,6 +15,34 @@ enum PairingSetup {
         return true
     }
 
+    /// True when a valid credential from the PC is waiting in the inbox.
+    static func pending(inbox: URL) -> Bool {
+        guard let data = try? Data(contentsOf: inbox) else { return false }
+        return valid(data)
+    }
+
+    /// Removes the inbox file (it contains the device credential and is visible in Files).
+    static func discard(inbox: URL) throws {
+        if FileManager.default.fileExists(atPath: inbox.path) {
+            try FileManager.default.removeItem(at: inbox)
+        }
+    }
+
+    /// Explicit replacement chosen by the user: validates, overwrites, then deletes the inbox.
+    static func replace(inbox: URL, destination: URL) throws {
+        let data = try Data(contentsOf: inbox)
+        guard valid(data) else { throw CocoaError(.fileReadCorruptFile) }
+        let manager = FileManager.default
+        let directory = destination.deletingLastPathComponent()
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(iOS)
+        try data.write(to: destination, options: [.atomic, .completeFileProtection])
+        #else
+        try data.write(to: destination, options: .atomic)
+        #endif
+        try manager.removeItem(at: inbox)
+    }
+
     /// Returns false if there is nothing to import. Never replaces an existing file.
     static func receive(inbox: URL, destination: URL) throws -> Bool {
         let manager = FileManager.default

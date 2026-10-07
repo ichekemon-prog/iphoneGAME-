@@ -82,6 +82,8 @@ struct ProbeView: View {
     @AppStorage("connectionDetailsExpanded") private var connectionDetailsExpanded = false
     @State private var hasPairing = false
     @State private var pairingSetupNote = ""
+    @State private var pcSetupWaiting = false
+    @State private var confirmingReplace = false
     @State private var ddiReady = DiskImage.ready
     @State private var ddiBusy = false
     @State private var ddiNote = ""
@@ -130,6 +132,17 @@ struct ProbeView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if pcSetupWaiting || !pairingSetupNote.isEmpty {
+                    Section("PCからの設定") {
+                        if !pairingSetupNote.isEmpty { Text(pairingSetupNote).font(.footnote) }
+                        if pcSetupWaiting {
+                            Button("PCから届いた設定に入れ替える") { confirmingReplace = true }
+                                .disabled(running || agent.active)
+                            Button("届いたファイルを削除（今の設定のまま使う）", role: .destructive) { discardPCSetup() }
+                                .disabled(running || agent.active)
+                        }
+                    }
+                }
                 Section("はじめに（準備の確認）") {
                     DisclosureGroup(isExpanded: $setupDetailsExpanded) {
                         SetupChecklistView(items: setupItems)
@@ -268,6 +281,12 @@ struct ProbeView: View {
                 }
             }
         }
+        .confirmationDialog("PCから届いた認証設定に入れ替えますか？", isPresented: $confirmingReplace, titleVisibility: .visible) {
+            Button("入れ替える", role: .destructive) { replaceWithPCSetup() }
+            Button("やめる", role: .cancel) {}
+        } message: {
+            Text("今の認証設定は上書きされます。入れ替えた後は、VPNを接続して接続診断で確認してください。")
+        }
         .fullScreenCover(isPresented: $editingInstruction) {
             InstructionEditor(instruction: $instruction)
         }
@@ -380,7 +399,10 @@ struct ProbeView: View {
         let inbox = documentsURL.appendingPathComponent(PairingSetup.inboxName)
         guard FileManager.default.fileExists(atPath: inbox.path) else { return }
         guard !FileManager.default.fileExists(atPath: pairingURL.path) else {
-            pairingSetupNote = "既存の認証設定を保持しています。入れ替える場合は「認証ファイルを読み込む」でPCから届いたファイルを選んでください。"
+            pcSetupWaiting = true
+            pairingSetupNote = PairingSetup.pending(inbox: inbox)
+                ? "PCから認証設定が届きました。このiPhoneには設定済みの認証があるため、自動では入れ替えていません。どちらかを選んでください。"
+                : "PCから届いたファイルの形式が正しくありません。PCでもう一度配置するか、ファイルを削除してください。"
             return
         }
         do {
@@ -395,6 +417,28 @@ struct ProbeView: View {
             pairingSetupNote = hasPairing
                 ? "設定は保存しましたが受け渡し用ファイルを消せませんでした。ファイルアプリでphone-runner-pairing.plistを削除してください。"
                 : "PCからの設定を受け取れませんでした。送信完了後にもう一度確認してください。既存設定は変更していません。"
+        }
+    }
+    private func replaceWithPCSetup() {
+        let inbox = documentsURL.appendingPathComponent(PairingSetup.inboxName)
+        do {
+            try PairingSetup.replace(inbox: inbox, destination: pairingURL)
+            refreshPairing()
+            connectionReport = .empty
+            pcSetupWaiting = false
+            pairingSetupNote = "PCから届いた設定に入れ替えました。VPNを接続して接続診断を実行してください。"
+        } catch {
+            pairingSetupNote = "入れ替えできませんでした（ファイルの形式を確認してください）。今の設定は変更していません。"
+        }
+    }
+    private func discardPCSetup() {
+        let inbox = documentsURL.appendingPathComponent(PairingSetup.inboxName)
+        do {
+            try PairingSetup.discard(inbox: inbox)
+            pcSetupWaiting = false
+            pairingSetupNote = "届いたファイルを削除しました。今の設定のまま使えます。"
+        } catch {
+            pairingSetupNote = "ファイルを削除できませんでした。ファイルアプリで phone-runner-pairing.plist を削除してください。"
         }
     }
     private func refreshPairing() {

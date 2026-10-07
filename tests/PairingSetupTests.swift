@@ -34,6 +34,22 @@ struct PairingSetupTests {
         try Data("replacement".utf8).write(to: inbox)
         do { _ = try PairingSetup.receive(inbox: inbox, destination: destination); fatalError("Existing credential overwritten") }
         catch { let kept = try Data(contentsOf: destination); assert(kept == valid) }
+        // Explicit user choices: replace or discard the waiting file.
+        assert(PairingSetup.pending(inbox: inbox) == false)
+        var other = fixture
+        other["identifier"] = "replacement"
+        let replacement = try PropertyListSerialization.data(fromPropertyList: other, format: .xml, options: 0)
+        try replacement.write(to: inbox)
+        assert(PairingSetup.pending(inbox: inbox))
+        try PairingSetup.replace(inbox: inbox, destination: destination)
+        let afterReplace = try Data(contentsOf: destination)
+        assert(afterReplace == replacement)
+        assert(!FileManager.default.fileExists(atPath: inbox.path))
+        try valid.write(to: inbox)
+        try PairingSetup.discard(inbox: inbox)
+        assert(!FileManager.default.fileExists(atPath: inbox.path))
+        let afterDiscard = try Data(contentsOf: destination)
+        assert(afterDiscard == replacement)
         print("Pairing setup tests passed")
     }
 }
