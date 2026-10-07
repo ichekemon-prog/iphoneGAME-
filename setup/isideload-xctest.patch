@@ -1,3 +1,24 @@
+diff -ru a/src/sideload/cert_identity.rs b/src/sideload/cert_identity.rs
+--- a/src/sideload/cert_identity.rs
++++ b/src/sideload/cert_identity.rs
+@@ -106,7 +106,16 @@
+             .serial_number
+             .as_bytes()
+             .encode_hex::<String>();
+-        serial.trim_start_matches('0').to_string().to_uppercase()
++        // Phone Runner Probe: keep the leading zero of the first byte so the
++        // value matches the developer portal (e.g. "0D24..." not "D24...").
++        // SideStore compares ALTCertificateID with the portal serial and
++        // otherwise tries to create a second certificate. Only whole zero
++        // bytes (DER sign padding) are removed.
++        let mut serial = serial.as_str();
++        while serial.len() > 2 && serial.starts_with("00") {
++            serial = &serial[2..];
++        }
++        serial.to_uppercase()
+     }
+ 
+     pub async fn retrieve<C: MaxCertsCallback>(
 diff -ru a/src/sideload/sign.rs b/src/sideload/sign.rs
 --- a/src/sideload/sign.rs
 +++ b/src/sideload/sign.rs

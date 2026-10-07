@@ -30,12 +30,14 @@ jobs:
         shell: bash
         run: |
           cd pc-setup/iloader/src-tauri
-          curl -fsSL -o "$RUNNER_TEMP/isideload.crate" https://static.crates.io/crates/isideload/isideload-0.4.4.crate
-          echo "$ISIDELOAD_CRATE_SHA256  $RUNNER_TEMP/isideload.crate" | sha256sum -c -
+          # Relative paths only: Windows tar reads "D:\..." as a remote host.
+          curl -fsSL -o isideload.crate https://static.crates.io/crates/isideload/isideload-0.4.4.crate
+          echo "$ISIDELOAD_CRATE_SHA256  isideload.crate" | sha256sum -c -
           mkdir isideload-patched
-          tar xzf "$RUNNER_TEMP/isideload.crate" --strip-components=1 -C isideload-patched
-          sed 's/\r$//' ../../../setup/isideload-xctest.patch > "$RUNNER_TEMP/isideload-xctest.patch"
-          (cd isideload-patched && patch -p1 < "$RUNNER_TEMP/isideload-xctest.patch")
+          tar -xzf isideload.crate --strip-components=1 -C isideload-patched
+          rm isideload.crate
+          sed 's/\r$//' ../../../setup/isideload-xctest.patch > isideload-patched/xctest.patch
+          (cd isideload-patched && patch -p1 < xctest.patch && rm xctest.patch)
           printf '\n[patch.crates-io]\nisideload = { path = "isideload-patched" }\n' >> Cargo.toml
           grep -n 'xctest' isideload-patched/src/sideload/sign.rs
       - uses: dtolnay/rust-toolchain@stable
