@@ -35,6 +35,10 @@ static STATUS: Mutex<String> = Mutex::new(String::new());
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
 /// Directory holding Image.dmg / Image.dmg.trustcache / BuildManifest.plist.
 static DDI_DIR: Mutex<String> = Mutex::new(String::new());
+/// Last installed-app list as JSON [{"name":..,"id":..}] for the app's pickers.
+static APPS: Mutex<String> = Mutex::new(String::new());
+/// WDA bundle id found automatically (empty if none).
+static DETECTED_RUNNER: Mutex<String> = Mutex::new(String::new());
 static FRAME: Mutex<Option<Arc<Vec<u8>>>> = Mutex::new(None);
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 static COMMANDS: Mutex<Option<mpsc::UnboundedSender<(String, std_mpsc::Sender<String>)>>> = Mutex::new(None);
@@ -83,8 +87,48 @@ fn stopped() -> bool {
     STOP.load(Ordering::SeqCst)
 }
 
+fn store_apps(apps: &[(String, String)]) {
+    let list: Vec<Value> = apps.iter().map(|(name, id)| json!({"name": name, "id": id})).collect();
+    if let Ok(mut a) = APPS.lock() {
+        *a = Value::Array(list).to_string();
+    }
+}
+
+/// WebDriverAgent's runner, e.g. com.facebook.WebDriverAgentRunner.xctrunner.<TEAM>.
+fn find_wda(apps: &[(String, String)]) -> Option<String> {
+    let lower = |s: &str| s.to_ascii_lowercase();
+    apps.iter()
+        .find(|(_, id)| lower(id).contains("webdriveragentrunner") && lower(id).contains("xctrunner"))
+        .or_else(|| apps.iter().find(|(name, id)| lower(id).contains("webdriveragent") || lower(name).contains("webdriveragent")))
+        .map(|(_, id)| id.clone())
+}
+
+/// Fills the runner bundle id from the installed apps when it was left empty.
+async fn detect_runner(t: &mut tunnel::Tunnel) -> Result<String, String> {
+    let apps = tunnel::list_user_apps(t).await?;
+    store_apps(&apps);
+    match find_wda(&apps) {
+        Some(id) => {
+            diagnostics::record("W0: WDAを自動検出", "passed", &id);
+            if let Ok(mut d) = DETECTED_RUNNER.lock() {
+                *d = id.clone();
+            }
+            Ok(id)
+        }
+        None => {
+            let e = "W0: WDA（WebDriverAgentRunner）がインストールされていません".to_string();
+            diagnostics::record("W0: WDAを自動検出", "failed", &e);
+            Err(e)
+        }
+    }
+}
+
 async fn list_apps(mut t: tunnel::Tunnel, docs: PathBuf) -> Result<String, String> {
     let apps = tunnel::list_user_apps(&mut t).await?;
+    store_apps(&apps);
+    if let (Some(id), Ok(mut d)) = (find_wda(&apps), DETECTED_RUNNER.lock()) {
+        *d = id;
+    }
     let text: String = apps.iter().map(|(name, id)| format!("{name}\t{id}\n")).collect();
     let saved = std::fs::write(docs.join("apps.txt"), &text).is_ok();
     Ok(format!("アプリ一覧（{}件）{}\n{text}", apps.len(), if saved { "・apps.txtに保存" } else { "" }))
@@ -203,6 +247,10 @@ async fn probe(path: String, host: String, runner: String, cfg: Config) -> Resul
     let addr = host.parse::<std::net::IpAddr>().map_err(|_| "接続先IPアドレスが不正です".to_string())?;
     let mut t = tunnel::open(path, addr).await?;
     let ddi_dir = DDI_DIR.lock().map(|d| d.clone()).unwrap_or_default();
+    let mut runner = runner;
+    if runner.trim().is_empty() && (cfg.diagnostic || !cfg.target.is_empty()) {
+        runner = detect_runner(&mut t).await?;
+    }
     if cfg.diagnostic {
         return diagnostics::run(t, &runner, &ddi_dir).await;
     }
@@ -336,6 +384,21 @@ pub unsafe extern "C" fn probe_set_ddi_dir(path: *const c_char) {
     }
 }
 
+/// Installed user apps as JSON [{"name","id"}] from the last list/diagnostic run.
+/// Caller frees with probe_free_string.
+#[unsafe(no_mangle)]
+pub extern "C" fn probe_apps() -> *mut c_char {
+    let s = APPS.lock().map(|a| a.clone()).unwrap_or_default();
+    CString::new(if s.is_empty() { "[]".to_string() } else { s }).unwrap_or_default().into_raw()
+}
+
+/// WDA bundle id found automatically ("" if none). Caller frees with probe_free_string.
+#[unsafe(no_mangle)]
+pub extern "C" fn probe_detected_runner() -> *mut c_char {
+    let s = DETECTED_RUNNER.lock().map(|a| a.clone()).unwrap_or_default();
+    CString::new(s).unwrap_or_default().into_raw()
+}
+
 /// Caller frees with probe_free_string. Contains no raw pairing/service data.
 #[unsafe(no_mangle)]
 pub extern "C" fn probe_diagnostics() -> *mut c_char {
@@ -415,5 +478,21 @@ pub extern "C" fn probe_status() -> *mut c_char {
 pub unsafe extern "C" fn probe_free_string(p: *mut c_char) {
     if !p.is_null() {
         drop(unsafe { CString::from_raw(p) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_wda;
+
+    #[test]
+    fn finds_the_wda_runner_among_user_apps() {
+        let apps = vec![
+            ("Phone Runner Probe".to_string(), "org.local.PhoneRunnerProbe.ABCDE12345".to_string()),
+            ("WebDriverAgentRunner-Runner".to_string(), "com.facebook.WebDriverAgentRunner.xctrunner.ABCDE12345".to_string()),
+            ("Game".to_string(), "jp.example.game".to_string()),
+        ];
+        assert_eq!(find_wda(&apps).as_deref(), Some("com.facebook.WebDriverAgentRunner.xctrunner.ABCDE12345"));
+        assert_eq!(find_wda(&apps[2..]), None);
     }
 }
