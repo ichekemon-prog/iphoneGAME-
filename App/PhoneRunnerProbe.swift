@@ -74,7 +74,7 @@ struct ProbeView: View {
     @State private var fetchingApps = false
     @State private var appListNote = ""
     @FocusState private var instructionFocused: Bool
-    @State private var status = "Phone Runner Probe"
+    @State private var status = "Tapilot"
     @State private var running = false
     @State private var connectionReport = ConnectionReport.empty
     @State private var readingDiagnostics = false
@@ -271,7 +271,7 @@ struct ProbeView: View {
                 }.disabled(running || agent.active)
             }
             .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("Phone Runner Probe")
+            .navigationTitle("Tapilot")
             .toolbar {
                 ToolbarItemGroup(placement: .keyboard) {
                     if instructionFocused {
