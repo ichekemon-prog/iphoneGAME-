@@ -41,6 +41,9 @@ jobs:
           cp -R build/Build/Products/Release-iphoneos/PhoneRunnerProbe.app package/Payload/
           cd package
           /usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes' Payload/PhoneRunnerProbe.app/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Payload/PhoneRunnerProbe.app/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName' Payload/PhoneRunnerProbe.app/Info.plist
+          test -f Payload/PhoneRunnerProbe.app/Assets.car
           zip -qr ../PhoneRunnerProbe-unsigned.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
