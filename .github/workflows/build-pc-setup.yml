@@ -13,6 +13,7 @@ jobs:
     env:
       ILOADER_COMMIT: 80142ff82fc3dfa7312d77ea6151b4d20090151b
       PAIRING_RS_SHA256: 6779bbe5c6d59f2c66da6d971791257fc1352d60c1c08b7360161c0828cde18f
+      ISIDELOAD_CRATE_SHA256: 85ceefdb91380923dae69895ae22c2152129fc2d5b95eb7f9c66c5980ff3761d
     steps:
       - uses: actions/checkout@v4
       - name: Fetch pinned iloader and apply the Phone Runner patch
@@ -25,6 +26,18 @@ jobs:
           sed 's/\r$//' ../../setup/iloader-phone-runner.patch > "$RUNNER_TEMP/phone-runner.patch"
           git apply "$RUNNER_TEMP/phone-runner.patch"
           grep -n 'phone-runner-pairing.plist' src-tauri/src/pairing.rs
+      - name: Patch isideload so .xctest bundles are signed without entitlements
+        shell: bash
+        run: |
+          cd pc-setup/iloader/src-tauri
+          curl -fsSL -o "$RUNNER_TEMP/isideload.crate" https://static.crates.io/crates/isideload/isideload-0.4.4.crate
+          echo "$ISIDELOAD_CRATE_SHA256  $RUNNER_TEMP/isideload.crate" | sha256sum -c -
+          mkdir isideload-patched
+          tar xzf "$RUNNER_TEMP/isideload.crate" --strip-components=1 -C isideload-patched
+          sed 's/\r$//' ../../../setup/isideload-xctest.patch > "$RUNNER_TEMP/isideload-xctest.patch"
+          (cd isideload-patched && patch -p1 < "$RUNNER_TEMP/isideload-xctest.patch")
+          printf '\n[patch.crates-io]\nisideload = { path = "isideload-patched" }\n' >> Cargo.toml
+          grep -n 'xctest' isideload-patched/src/sideload/sign.rs
       - uses: dtolnay/rust-toolchain@stable
       - uses: ilammy/msvc-dev-cmd@v1
       - name: Install Perl and Make
