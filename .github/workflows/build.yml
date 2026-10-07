@@ -20,9 +20,16 @@ jobs:
           git -C vendor/idevice checkout d32c8189c51c2789496b0768039419c3705498c3
           git -C vendor/idevice apply ../../patches/idevice-run-over-rsd.patch
           git -C vendor/idevice diff --stat
+      - name: Test PC pairing inbox
+        run: |
+          swiftc App/PairingSetup.swift tests/PairingSetupTests.swift -o "$RUNNER_TEMP/pairing-setup-tests"
+          "$RUNNER_TEMP/pairing-setup-tests"
       - name: Test diagnostic reporting
         working-directory: core
         run: cargo +stable test diagnostics::tests -- --test-threads=1
+      - name: Test image coordinate conversion
+        working-directory: core
+        run: cargo +stable test coordinates::tests
       - name: Build Rust core
         working-directory: core
         run: cargo +stable build --release --target aarch64-apple-ios
