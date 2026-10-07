@@ -1,0 +1,8 @@
+diff --git a/src-tauri/src/pairing.rs b/src-tauri/src/pairing.rs
+--- a/src-tauri/src/pairing.rs
++++ b/src-tauri/src/pairing.rs
+@@ -33,2 +33,4 @@
+ const PAIRING_APPS: &[(&str, &str)] = &[
++    ("PhoneRunnerProbe", "phone-runner-pairing.plist"),
++    ("Phone Runner Probe", "phone-runner-pairing.plist"),
+     ("SideStore", "ALTPairingFile.mobiledevicepairing"),

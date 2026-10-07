@@ -10,6 +10,7 @@ targets:
     info:
       path: Support/Info.plist
       properties:
+        CFBundleDisplayName: Phone Runner Probe
         UIBackgroundModes: [audio]
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true

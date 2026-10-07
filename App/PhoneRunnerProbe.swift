@@ -81,6 +81,7 @@ struct ProbeView: View {
     @AppStorage("setupDetailsExpanded") private var setupDetailsExpanded = false
     @AppStorage("connectionDetailsExpanded") private var connectionDetailsExpanded = false
     @State private var hasPairing = false
+    @State private var pairingSetupNote = ""
     @State private var ddiReady = DiskImage.ready
     @State private var ddiBusy = false
     @State private var ddiNote = ""
@@ -249,6 +250,8 @@ struct ProbeView: View {
                         TextField("操作するアプリのBundle ID", text: $target)
                             .textInputAutocapitalization(.never).autocorrectionDisabled()
                         Button("認証ファイルを読み込む") { importing = true }
+                        Button("PCから届いた設定を確認") { receivePCSetup() }
+                        if !pairingSetupNote.isEmpty { Text(pairingSetupNote).font(.footnote) }
                         Text(hasPairing ? "Remote Pairing情報を確認済み（端末内のみ）" : "Remote Pairing情報が未設定、または形式が不正です")
                             .font(.footnote)
                     }
@@ -279,6 +282,7 @@ struct ProbeView: View {
         .onAppear {
             apps = InstalledApps.targets(InstalledApps.cached())
             refreshPairing()
+            receivePCSetup()
             agent.probeInFront = true
             Notifier.requestPermission()
             expiry = ProvisionInfo.expiration
@@ -341,6 +345,7 @@ struct ProbeView: View {
             } else if newPhase == .active {
                 endBackgroundTask()
                 expiry = ProvisionInfo.expiration
+                receivePCSetup()
             }
         }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
@@ -369,6 +374,28 @@ struct ProbeView: View {
               let privateKey = plist["private_key"] as? Data, privateKey.count == 32,
               let identifier = plist["identifier"] as? String, !identifier.isEmpty else { return false }
         return true
+    }
+    private func receivePCSetup() {
+        guard !running && !agent.active else { return }
+        let inbox = documentsURL.appendingPathComponent(PairingSetup.inboxName)
+        guard FileManager.default.fileExists(atPath: inbox.path) else { return }
+        guard !FileManager.default.fileExists(atPath: pairingURL.path) else {
+            pairingSetupNote = "既存の認証設定を保持しています。入れ替える場合は「認証ファイルを読み込む」でPCから届いたファイルを選んでください。"
+            return
+        }
+        do {
+            if try PairingSetup.receive(inbox: inbox, destination: pairingURL) {
+                refreshPairing()
+                connectionReport = .empty
+                pairingSetupNote = "PCから認証設定を受け取りました。VPNを接続して接続診断を実行してください。"
+                status = pairingSetupNote
+            }
+        } catch {
+            refreshPairing()
+            pairingSetupNote = hasPairing
+                ? "設定は保存しましたが受け渡し用ファイルを消せませんでした。ファイルアプリでphone-runner-pairing.plistを削除してください。"
+                : "PCからの設定を受け取れませんでした。送信完了後にもう一度確認してください。既存設定は変更していません。"
+        }
     }
     private func refreshPairing() {
         guard let data = try? Data(contentsOf: pairingURL), data.count < 1_048_576,
