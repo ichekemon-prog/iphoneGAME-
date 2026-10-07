@@ -43,7 +43,7 @@ enum AgentResponse {
                 "thought": ["type": "string"],
                 "memo": ["type": "string"],
             ] as [String: Any],
-            "required": ["action"],
+            "required": ["action", "x", "y", "x2", "y2", "seconds"],
             "additionalProperties": false,
         ]
         return ["responseMimeType": "application/json", "responseJsonSchema": schema, "temperature": 0.2]
