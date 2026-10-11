@@ -62,6 +62,9 @@ struct ProbeView: View {
     @AppStorage("imageDetail") private var imageDetail = ImageDetail.medium.rawValue
     @AppStorage("notifyHistory") private var notifyHistory = true
     @AppStorage("quickText") private var quickText = true
+    @AppStorage("flickOn") private var flickOn = false
+    @AppStorage("flickAfter") private var flickAfter = "出撃"
+    @AppStorage("flickWait") private var flickWait = 4.0
     @AppStorage("agentInstruction") private var instruction = ""
     @AppStorage("agentMaxSteps") private var maxSteps = 20
     @AppStorage("agentInterval") private var interval = 6.0
@@ -212,6 +215,13 @@ struct ProbeView: View {
                     Toggle("「」で囲んだボタンはAIなしで押す", isOn: $quickText)
                     Text("指示に「出撃」を押す、のように書くと、iPhoneが画面の文字を読んで直接押します（速い・トークン0）。見つからないときだけAIに聞きます。購入・ガチャ・設定などの言葉は対象外です。")
                         .font(.caption).foregroundStyle(.secondary)
+                    Toggle("指定の文字を押した後はAIなしではじく（簡単なバトル用）", isOn: $flickOn)
+                    if flickOn {
+                        TextField("はじき開始の文字（例：出撃）", text: $flickAfter)
+                        Stepper("はじいた後の待ち \(Int(flickWait)) 秒", value: $flickWait, in: 2...10, step: 1)
+                        Text("画面中央からランダムな方向にはじきます。画面が止まったら中央をタップし、それでも動かなければAIに任せます。購入・コンティニューの文字が出たらはじきません。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Toggle("AIとのやり取りを通知センターに残す", isOn: $notifyHistory)
                     Text("バナーは出さず、通知センターとロック画面に1手ずつ残します（操作中の画面は隠しません）。")
                         .font(.caption).foregroundStyle(.secondary)
@@ -537,6 +547,8 @@ struct ProbeView: View {
         }
         agent.notifyHistory = notifyHistory
         agent.quickText = quickText
+        agent.flickAfter = flickOn ? flickAfter.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        agent.flickWait = flickWait
         agent.start(instruction: instruction, brain: GeminiBrain(apiKey: key, model: model,
                                                     detail: ImageDetail(rawValue: imageDetail) ?? .medium),
                     maxSteps: maxSteps, interval: interval, execute: execute)

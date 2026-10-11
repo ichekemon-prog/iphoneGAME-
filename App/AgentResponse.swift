@@ -184,7 +184,7 @@ struct TextBox: Equatable {
 /// Fixed buttons are pressed by their text without asking the AI: the user writes them in 「」 in the instruction.
 enum ScreenText {
     /// Never pressed without the AI, even when quoted (purchases, account and settings changes).
-    static let forbidden = ["購入", "課金", "ガチャ", "オーブ", "支払", "決済", "削除", "ログアウト", "設定", "引き継", "回復", "アイテム", "ショップ", "送信"]
+    static let forbidden = ["購入", "課金", "ガチャ", "オーブ", "支払", "決済", "削除", "ログアウト", "設定", "引き継", "回復", "アイテム", "ショップ", "送信", "コンティニュー"]
     /// A line with one of these is a prohibition, not a step.
     static let negative = ["押さない", "押すな", "タップしない", "選ばない", "触らない", "禁止", "使わない", "しない"]
     /// Words that mark a line as "press this".
@@ -229,19 +229,48 @@ enum ScreenText {
         return label == key || (label.contains(key) && label.count <= key.count + 2)
     }
 
-    /// The word to press now, or nil to ask the AI. Prefers the step right after the last one pressed
-    /// (the order written, wrapping around for repeated runs); a word on screen several times is not pressed.
-    static func pick(words: [String], boxes: [TextBox], after last: Int?, blocked: Set<String>) -> (index: Int, box: TextBox)? {
+    /// The word to press now, or nil to ask the AI. Only the next steps after the last one pressed are
+    /// tried (the order written, wrapping around for repeated runs), so a title such as 「追憶の書庫」 left on a
+    /// later screen is not pressed again. A word on screen several times, or at a spot that already did
+    /// nothing in this run, is not pressed.
+    static func pick(words: [String], boxes: [TextBox], after last: Int?, blocked: Set<String>,
+                     dead: [TextBox] = [], window: Int = 2) -> (index: Int, box: TextBox)? {
         guard !words.isEmpty else { return nil }
-        let start = last.map { $0 + 1 } ?? 0
-        for offset in 0..<words.count {
-            let index = (start + offset) % words.count
+        let order: [Int] = last.map { last in
+            (1...min(window, words.count)).map { (last + $0) % words.count }
+        } ?? Array(words.indices)
+        for index in order {
             let word = words[index]
             guard !blocked.contains(word) else { continue }
-            let hits = boxes.filter { matches($0, word) }
+            let hits = boxes.filter { box in
+                matches(box, word) && !dead.contains { spot in
+                    normalize(spot.text) == normalize(box.text) && abs(spot.x - box.x) < 40 && abs(spot.y - box.y) < 40
+                }
+            }
             if hits.count == 1 { return (index, hits[0]) }
         }
         return nil
+    }
+
+    /// The quoted word whose box contains a tap (used to follow the order when the AI pressed it).
+    static func word(at x: Double, _ y: Double, words: [String], boxes: [TextBox]) -> Int? {
+        for box in boxes where abs(box.x - x) <= max(box.width / 2, 20) && abs(box.y - y) <= max(box.height / 2, 20) {
+            if let index = words.firstIndex(where: { matches(box, $0) }) { return index }
+        }
+        return nil
+    }
+
+    /// True when the screen shows a word that must never be pressed blindly (purchase, continue with paid items…).
+    static func risky(_ boxes: [TextBox]) -> Bool {
+        boxes.contains { box in forbidden.contains { normalize(box.text).contains($0) } }
+    }
+
+    /// A quick flick for simple battles: from the middle of the screen in a random direction.
+    static func flick(angle: Double, length: Double = 260) -> (x: Double, y: Double, x2: Double, y2: Double) {
+        let x = 500.0, y = 550.0
+        let x2 = min(max(x + cos(angle) * length, 20), 980)
+        let y2 = min(max(y + sin(angle) * length, 120), 950)
+        return (x, y, x2, y2)
     }
 
     /// Short list of the readable text for the AI, so it can aim at exact positions.

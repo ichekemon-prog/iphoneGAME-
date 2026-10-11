@@ -150,6 +150,9 @@ final class AgentRunner: ObservableObject {
     /// Read the screen's text on the iPhone: quoted buttons (「出撃」) are pressed without the AI,
     /// and the AI gets the text positions so it aims precisely.
     var quickText = true
+    /// After pressing this quoted word (e.g. 出撃), flick without the AI until the battle ends. Empty = off.
+    var flickAfter = ""
+    var flickWait = 4.0
     private var runThread = "tapilot"
 
     private var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
@@ -284,8 +287,14 @@ final class AgentRunner: ObservableObject {
         var lastWord: Int?
         var blocked = Set<String>()
         var blockedPrint: [UInt8] = []
+        var deadSpots: [TextBox] = [] // text that did nothing when pressed (titles, labels); skipped for this run
         var lastTapPrint: [UInt8] = []
         var textTaps = 0
+        let flickKey = ScreenText.normalize(flickAfter)
+        var flicking = false
+        var flicks = 0
+        var stuckFlicks = 0
+        if !flickKey.isEmpty { add("「\(flickAfter)」の後はAIなしではじきます（\(Int(flickWait))秒ごと）") }
 
         while step < maxSteps && !stopRequested && agent_ready() {
             if probeInFront {
@@ -308,7 +317,8 @@ final class AgentRunner: ObservableObject {
             }
 
             // Fixed buttons written in 「」: press by their text, no AI call.
-            if execute, let hit = ScreenText.pick(words: quickWords, boxes: boxes, after: lastWord, blocked: blocked) {
+            if execute, let hit = ScreenText.pick(words: quickWords, boxes: boxes, after: lastWord,
+                                                             blocked: blocked, dead: deadSpots) {
                 step += 1
                 textTaps += 1
                 let word = quickWords[hit.index]
@@ -324,15 +334,56 @@ final class AgentRunner: ObservableObject {
                 if notifyHistory { Notifier.postQuiet("Tapilot \(step)手目 「\(word)」", line, thread: runThread) }
                 if changed {
                     lastWord = hit.index
+                    flicking = !flickKey.isEmpty && ScreenText.normalize(word) == flickKey
+                    stuckFlicks = 0
                 } else {
                     blocked.insert(word)
                     blockedPrint = shot
-                    add("  「\(word)」を押しても画面が変わらないため、この画面ではAIに任せます")
+                    deadSpots.append(hit.box)
+                    add("  「\(word)」はこの位置では押しても変わらないため、今回は押しません（AIに任せます）")
                 }
                 history.append("\(step). tap「\(word)」→ \(changed ? "画面変化" : "変化なし")")
                 lastTap = nil
                 repeatedTaps = 0
                 continue
+            }
+
+            // Simple battles: flick in a random direction without the AI. A screen that stops moving
+            // (results, dialogs) gets a tap in the middle; after 3 still screens the AI takes over.
+            if execute && flicking {
+                if ScreenText.risky(boxes) {
+                    add("  購入・コンティニュー等の文字があるため、はじくのをやめてAIに任せます")
+                    flicking = false
+                } else if stuckFlicks >= 3 {
+                    add("  画面が動かないため、はじくのをやめてAIに任せます")
+                    flicking = false
+                    stuckFlicks = 0
+                } else {
+                    flicks += 1
+                    let size = ["image_width": screen.pixels.width, "image_height": screen.pixels.height]
+                    let label: String
+                    var action: [String: Any]
+                    if stuckFlicks == 0 {
+                        let f = ScreenText.flick(angle: Double.random(in: 0..<(2 * Double.pi)))
+                        action = ["type": "swipe", "x": f.x, "y": f.y, "x2": f.x2, "y2": f.y2, "ms": 250]
+                        label = "はじく(\(Int(f.x2)),\(Int(f.y2)))"
+                    } else {
+                        action = ["type": "tap", "x": 500.0, "y": 500.0]
+                        label = "中央をタップ"
+                    }
+                    action.merge(size) { a, _ in a }
+                    phaseText = "はじき \(flicks)回目（AIなし）"
+                    let result = await command(action)
+                    if result.hasPrefix("error") { add("はじき: \(result)"); add("操作エラーのため停止しました"); break }
+                    await pause(flickWait)
+                    let after = latestFrame().flatMap { UIImage(data: $0)?.cgImage }.map(TextReader.thumbnail) ?? []
+                    let moved = shot.isEmpty || after.isEmpty || ScreenText.difference(after, shot) >= ScreenText.unchanged
+                    stuckFlicks = moved ? 0 : stuckFlicks + 1
+                    add("はじき\(flicks)回目 \(label)［AIなし］\(moved ? "" : "→ 画面変化なし")")
+                    history.append("（AIなし）\(label)")
+                    if history.count > 50 { history.removeFirst(history.count - 50) }
+                    continue
+                }
             }
 
             // Respect the minimum interval between AI calls (free tier limits), then look again.
@@ -466,6 +517,12 @@ final class AgentRunner: ObservableObject {
             var result = "見送り（観察のみ）"
             switch decision.action {
             case "tap" where execute:
+                // Keep the order of the quoted steps when the AI pressed one of them.
+                if let index = ScreenText.word(at: decision.x ?? -1, decision.y ?? -1, words: quickWords, boxes: boxes) {
+                    lastWord = index
+                    flicking = !flickKey.isEmpty && ScreenText.normalize(quickWords[index]) == flickKey
+                    stuckFlicks = 0
+                }
                 result = await command(["type": "tap", "x": decision.x ?? -1, "y": decision.y ?? -1,
                                         "image_width": pixels.width, "image_height": pixels.height])
             case "swipe" where execute:
@@ -496,7 +553,7 @@ final class AgentRunner: ObservableObject {
             history.append("\(step). \(decision.action)\(coords) → \(result)｜\(decision.thought ?? "")")
         }
         let average = aiCalls > 0 ? String(format: " / AI平均 %.1f秒・%d tok／手", aiSeconds / Double(aiCalls), totalTokens / aiCalls) : ""
-        add("終了: \(step)手（うちAIなし \(textTaps)手）\(average) / API報告トークン合計 \(totalTokens)（取得できた分）")
+        add("終了: \(step)手（うちAIなし \(textTaps)手）＋はじき\(flicks)回\(average) / API報告トークン合計 \(totalTokens)（取得できた分）")
         phaseText = "終了"
     }
 }
