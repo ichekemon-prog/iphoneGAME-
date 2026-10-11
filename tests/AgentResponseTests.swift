@@ -57,11 +57,35 @@ struct AgentResponseTests {
         precondition((fast["thinkingConfig"] as? [String: Any])?["thinkingLevel"] as? String == "MINIMAL")
         _ = try JSONSerialization.data(withJSONObject: fast)
         let plain = AgentResponse.generationConfig(model: "gemini-3.5-flash-lite", detail: .low, thinking: false)
+        precondition(fast["temperature"] == nil && fast["maxOutputTokens"] as? Int == 512)
+        precondition(AgentResponse.generationConfig(model: "gemini-2.5-flash", detail: .low, thinking: true)["temperature"] as? Double == 0.2)
         precondition(plain["thinkingConfig"] == nil && plain["mediaResolution"] as? String == "MEDIA_RESOLUTION_LOW")
         precondition(AgentResponse.isTransient(status: 503) && !AgentResponse.isTransient(status: 429))
         let used = AgentResponse.usage(["usageMetadata": ["promptTokenCount": 700, "candidatesTokenCount": 40,
                                                           "thoughtsTokenCount": 12, "totalTokenCount": 752]])
         precondition(used.prompt == 700 && used.output == 40 && used.thoughts == 12 && used.total == 752)
+        let words = ScreenText.quickWords(in: """
+        1. ホーム画面で「クエスト」を押す。
+        2. 「追憶の書庫」を開き、難易度「究極」のクエストを1つ選ぶ。
+        3. 「ソロ」を押す。
+        5. 編成画面で「出撃」を押す。
+        12. 「オーブ」は絶対に押さない。
+        13. 「ガチャ」を押す。
+        14. 「ＯＫ」をタップ
+        """)
+        precondition(words == ["クエスト", "追憶の書庫", "究極", "ソロ", "出撃", "ＯＫ"], "\(words)")
+        precondition(ScreenText.normalize("Ｏ Ｋ") == "ok")
+        let solo = TextBox(text: "ソロ", x: 300, y: 700, width: 80, height: 30)
+        let sortie = TextBox(text: "出撃!", x: 500, y: 880, width: 120, height: 40)
+        let long = TextBox(text: "出撃する前に編成を確認", x: 500, y: 200, width: 400, height: 30)
+        precondition(ScreenText.matches(sortie, "出撃") && !ScreenText.matches(long, "出撃"))
+        precondition(ScreenText.pick(words: words, boxes: [solo, sortie, long], after: nil, blocked: [])?.index == 3)
+        precondition(ScreenText.pick(words: words, boxes: [solo, sortie], after: 3, blocked: [])?.index == 4)
+        precondition(ScreenText.pick(words: words, boxes: [solo, sortie], after: 3, blocked: ["出撃"])?.index == 3)
+        precondition(ScreenText.pick(words: words, boxes: [solo, solo], after: nil, blocked: []) == nil)
+        precondition(ScreenText.pick(words: words, boxes: [long], after: nil, blocked: []) == nil)
+        precondition(ScreenText.describe([sortie, solo]) == "ソロ(300,700) 出撃!(500,880)")
+        precondition(ScreenText.difference([0, 10], [0, 20]) == 5 && ScreenText.difference([], []) == 255)
         print("Agent response tests passed")
     }
 }

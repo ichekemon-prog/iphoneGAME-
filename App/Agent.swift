@@ -62,18 +62,22 @@ struct GeminiBrain {
     - swipe: (x,y)から(x2,y2)へスワイプ。
     - wait: 読み込み中・演出中などで待つ。secondsに秒数（1〜10）。
     - done: 指示を達成した、または続行できない。thoughtに理由。
-    - memo: このアプリについて次回以降も役立つ気づきがあれば1行で（例: 「出撃ボタンは画面下中央」）。なければ空。
+    - memo: このアプリについて次回以降も役立つ気づきがあれば30文字以内で1つだけ（例: 「出撃ボタンは画面下中央」）。なければ空。同じ言葉を繰り返さない。
     ルール:
     - 課金・購入・有料通貨の使用、アカウントや設定の変更、外部へのリンクは絶対に押さない。その画面になったらdone。
-    - 確信がないときは押さずにwaitを選ぶ。同じ操作を繰り返して画面が変わらないときは別の方法を考える。
+    - 指示の次の手順に合うボタンが見えたら、迷わず押す。waitは読み込み中・演出中など押せるものがないときだけ。
+    - 「画面の文字」に座標が書かれていれば、そのボタンはその座標を押す（自分で位置を推測するより正確）。
+    - 同じ操作を繰り返して画面が変わらないときは別の方法を考える。
     - 直前の操作の結果を、今の画面で確認してから次を決める。
     - WDA受理は画面が進んだ証拠ではありません。進まない場合、ボタンの背景を含む領域を見直し、実際に押せる中心を再確認してください。
     """
 
-    func decide(instruction: String, step: Int, maxSteps: Int, history: [String], memos: [String], jpeg: Data) async throws -> (Decision, TokenUsage) {
+    func decide(instruction: String, step: Int, maxSteps: Int, history: [String], memos: [String], jpeg: Data,
+                screenText: String = "") async throws -> (Decision, TokenUsage) {
         var text = "指示: \(instruction)\nステップ: \(step)/\(maxSteps)\n"
         text += "直近の行動:\n" + (history.isEmpty ? "（なし）\n" : history.suffix(6).joined(separator: "\n") + "\n")
         text += "経験メモ:\n" + (memos.isEmpty ? "（なし）\n" : memos.suffix(20).map { "- \($0)" }.joined(separator: "\n") + "\n")
+        if !screenText.isEmpty { text += "画面の文字（端末で読み取り、中心座標）: \(screenText)\n" }
         text += "今の画面を見て、次の1手をJSONで答えてください。"
 
         let body: [String: Any] = [
@@ -120,7 +124,7 @@ struct GeminiBrain {
             if code == 400, message.lowercased().contains("thinking"), !Self.noThinking.contains(model) {
                 Self.noThinking.insert(model)
                 return try await decide(instruction: instruction, step: step, maxSteps: maxSteps,
-                                        history: history, memos: memos, jpeg: jpeg)
+                                        history: history, memos: memos, jpeg: jpeg, screenText: screenText)
             }
             throw BrainError.http(code, String(message.prefix(160)))
         }
@@ -141,6 +145,12 @@ final class AgentRunner: ObservableObject {
     var probeInFront = true
     private var stopRequested = false
     private var task: Task<Void, Never>?
+    /// Leave each step (AI decision, tokens, result) in Notification Center without banners.
+    var notifyHistory = false
+    /// Read the screen's text on the iPhone: quoted buttons (「出撃」) are pressed without the AI,
+    /// and the AI gets the text positions so it aims precisely.
+    var quickText = true
+    private var runThread = "tapilot"
 
     private var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
     private var memoryURL: URL { documents.appendingPathComponent("agent_memory.txt") }
@@ -166,6 +176,7 @@ final class AgentRunner: ObservableObject {
         stopRequested = false
         active = true
         log = []
+        runThread = "tapilot-\(Int(Date().timeIntervalSince1970))"
         tapPreview = nil
         add("開始: \(execute ? "実行モード" : "観察のみ（操作しない）") / 最大\(maxSteps)手 / \(brain.model)")
         add("指示: \(instruction)")
@@ -213,6 +224,38 @@ final class AgentRunner: ObservableObject {
         }.value
     }
 
+    private struct Screen {
+        let jpeg: Data
+        let image: UIImage
+        let pixels: CGImage
+    }
+
+    /// Wait for a newly delivered frame rather than reusing a stalled stream.
+    private func freshScreen() async -> Screen? {
+        let previous = agent_frame_seq()
+        var waits = 0
+        while agent_frame_seq() == previous && waits < 25 && !stopRequested {
+            await pause(0.2)
+            waits += 1
+        }
+        guard agent_frame_seq() != previous, let jpeg = latestFrame(),
+              let image = UIImage(data: jpeg), let pixels = image.cgImage else { return nil }
+        return Screen(jpeg: jpeg, image: image, pixels: pixels)
+    }
+
+    /// True once the screen differs from `before` (checked every 0.25 s, up to `limit` seconds).
+    private func waitForChange(from before: [UInt8], limit: Double) async -> Bool {
+        guard !before.isEmpty else { await pause(1); return true }
+        var waited = 0.0
+        while waited < limit && !stopRequested {
+            await pause(0.25)
+            waited += 0.25
+            guard let jpeg = latestFrame(), let image = UIImage(data: jpeg)?.cgImage else { continue }
+            if ScreenText.difference(TextReader.thumbnail(image), before) >= ScreenText.unchanged { return true }
+        }
+        return false
+    }
+
     private func loop(instruction: String, brain: GeminiBrain, maxSteps: Int, interval: Double, execute: Bool) async {
         phaseText = "WDAとゲーム画面の準備待ち"
         var waited = 0.0
@@ -234,6 +277,15 @@ final class AgentRunner: ObservableObject {
         var transientRetries = 0
         var aiSeconds = 0.0
         var aiCalls = 0
+        let quickWords = quickText ? ScreenText.quickWords(in: instruction) : []
+        if !quickWords.isEmpty {
+            add("AIなしで押す文字: " + quickWords.map { "「\($0)」" }.joined(separator: " "))
+        }
+        var lastWord: Int?
+        var blocked = Set<String>()
+        var blockedPrint: [UInt8] = []
+        var lastTapPrint: [UInt8] = []
+        var textTaps = 0
 
         while step < maxSteps && !stopRequested && agent_ready() {
             if probeInFront {
@@ -241,26 +293,63 @@ final class AgentRunner: ObservableObject {
                 await pause(1)
                 continue
             }
-            // Respect the minimum interval between AI calls (free tier limits).
-            let gap = interval - Date().timeIntervalSince(lastCall)
-            if gap > 0 { await pause(gap) }
             await pause(0.8) // let the last action settle
             if stopRequested { break }
             if probeInFront { continue }
-            // Require a newly delivered frame, rather than reusing a stalled stream.
-            let previousSequence = agent_frame_seq()
-            var frameWaits = 0
-            while agent_frame_seq() == previousSequence && frameWaits < 25 && !stopRequested {
-                await pause(0.2)
-                frameWaits += 1
-            }
-            if stopRequested { break }
-            if probeInFront { continue }
-            guard agent_frame_seq() != previousSequence,
-                  let jpeg = latestFrame(), let frame = UIImage(data: jpeg), let pixels = frame.cgImage else {
-                add("新しい画面を取得できないため停止しました。接続を確認してください")
+            guard var screen = await freshScreen() else {
+                if !stopRequested { add("新しい画面を取得できないため停止しました。接続を確認してください") }
                 break
             }
+            if probeInFront { continue }
+            var boxes = quickText ? await TextReader.read(screen.pixels) : []
+            var shot = TextReader.thumbnail(screen.pixels)
+            if !blocked.isEmpty, ScreenText.difference(shot, blockedPrint) >= ScreenText.unchanged {
+                blocked.removeAll()
+            }
+
+            // Fixed buttons written in 「」: press by their text, no AI call.
+            if execute, let hit = ScreenText.pick(words: quickWords, boxes: boxes, after: lastWord, blocked: blocked) {
+                step += 1
+                textTaps += 1
+                let word = quickWords[hit.index]
+                phaseText = "\(step)手目: 「\(word)」を押しています（AIなし）"
+                let started = Date()
+                let result = await command(["type": "tap", "x": hit.box.x, "y": hit.box.y,
+                                            "image_width": screen.pixels.width, "image_height": screen.pixels.height])
+                if result.hasPrefix("error") { add("\(step)手目 文字タップ「\(word)」: \(result)"); add("操作エラーのため停止しました"); break }
+                let changed = await waitForChange(from: shot, limit: 3)
+                let elapsed = String(format: "%.1f", Date().timeIntervalSince(started))
+                let line = "\(step)手目 文字タップ「\(word)」(\(Int(hit.box.x)),\(Int(hit.box.y)))［AIなし \(elapsed)秒］→ \(changed ? "画面が変化" : "変化なし")"
+                add(line)
+                if notifyHistory { Notifier.postQuiet("Tapilot \(step)手目 「\(word)」", line, thread: runThread) }
+                if changed {
+                    lastWord = hit.index
+                } else {
+                    blocked.insert(word)
+                    blockedPrint = shot
+                    add("  「\(word)」を押しても画面が変わらないため、この画面ではAIに任せます")
+                }
+                history.append("\(step). tap「\(word)」→ \(changed ? "画面変化" : "変化なし")")
+                lastTap = nil
+                repeatedTaps = 0
+                continue
+            }
+
+            // Respect the minimum interval between AI calls (free tier limits), then look again.
+            let gap = interval - Date().timeIntervalSince(lastCall)
+            if gap > 0.3 {
+                await pause(gap)
+                if stopRequested { break }
+                if probeInFront { continue }
+                guard let newer = await freshScreen() else {
+                    if !stopRequested { add("新しい画面を取得できないため停止しました。接続を確認してください") }
+                    break
+                }
+                screen = newer
+                boxes = quickText ? await TextReader.read(screen.pixels) : []
+                shot = TextReader.thumbnail(screen.pixels)
+            }
+            let jpeg = screen.jpeg, frame = screen.image, pixels = screen.pixels
             step += 1
             phaseText = "\(step)手目: AIが判断中"
             lastCall = Date()
@@ -269,7 +358,8 @@ final class AgentRunner: ObservableObject {
             do {
                 let started = Date()
                 let (d, usage) = try await brain.decide(instruction: instruction, step: step, maxSteps: maxSteps,
-                                                       history: history, memos: memos, jpeg: jpeg)
+                                                       history: history, memos: memos, jpeg: jpeg,
+                                                       screenText: ScreenText.describe(boxes))
                 decision = d
                 let seconds = Date().timeIntervalSince(started)
                 aiSeconds += seconds
@@ -332,7 +422,7 @@ final class AgentRunner: ObservableObject {
                 default: return ""
                 }
             }()
-            add("\(step)手目 \(decision.action)\(coords) \(cost)\n  見: \(decision.observation ?? "-")\n  考: \(decision.thought ?? "-")")
+            add("\(step)手目 \(decision.action)\(coords) \(cost)\n  見: \((decision.observation ?? "-").prefix(60))\n  考: \((decision.thought ?? "-").prefix(60))")
             if decision.action == "tap", let x = decision.x, let y = decision.y {
                 let size = CGSize(width: CGFloat(pixels.width), height: CGFloat(pixels.height))
                 let format = UIGraphicsImageRendererFormat()
@@ -349,21 +439,24 @@ final class AgentRunner: ObservableObject {
                 tapPreview = preview
                 try? preview.jpegData(compressionQuality: 0.85)?.write(to: stepsDir.appendingPathComponent(String(format: "step_%03d_tap.jpg", step)))
                 if execute {
+                    // Count only taps that left the screen as it was (result screens advanced by tapping are fine).
                     let point = CGPoint(x: x, y: y)
-                    if let previous = lastTap, abs(previous.x - point.x) <= 15, abs(previous.y - point.y) <= 15 {
-                        repeatedTaps += 1
-                    } else {
-                        lastTap = point
-                        repeatedTaps = 1
-                    }
+                    let sameSpot = lastTap.map { abs($0.x - point.x) <= 15 && abs($0.y - point.y) <= 15 } ?? false
+                    let sameScreen = shot.isEmpty || lastTapPrint.isEmpty
+                        || ScreenText.difference(shot, lastTapPrint) < ScreenText.unchanged
+                    repeatedTaps = sameSpot && sameScreen ? repeatedTaps + 1 : 1
+                    lastTap = point
+                    lastTapPrint = shot
                     if repeatedTaps > 3 {
-                        add("同じ付近へのタップが3回続いたため、4回目は送らず停止しました。赤丸の位置と実際のボタンを確認してください（画面変化の自動判定ではありません）")
+                        add("同じ場所を押しても画面が変わらない状態が3回続いたため、4回目は送らず停止しました。赤丸の位置と実際のボタンを確認してください")
                         break
                     }
                 }
             }
 
-            if let memo = decision.memo?.trimmingCharacters(in: .whitespacesAndNewlines), !memo.isEmpty,
+            if let memo = decision.memo?.trimmingCharacters(in: .whitespacesAndNewlines), memo.count > 60 {
+                add("  メモが長すぎるため保存しません（\(memo.count)文字）")
+            } else if let memo = decision.memo?.trimmingCharacters(in: .whitespacesAndNewlines), !memo.isEmpty,
                !memos.contains(memo) {
                 let all = (memos + [memo]).suffix(50).joined(separator: "\n") + "\n"
                 try? all.write(to: memoryURL, atomically: true, encoding: .utf8)
@@ -395,11 +488,15 @@ final class AgentRunner: ObservableObject {
                 result = "未対応の行動"
             }
             add("  結果: \(result)")
+            if notifyHistory {
+                Notifier.postQuiet("Tapilot \(step)手目 \(decision.action)\(coords)",
+                                   "\((decision.thought ?? "-").prefix(60)) \(cost)\n→ \(result)", thread: runThread)
+            }
             if result.hasPrefix("error") { add("操作エラーのため停止しました"); break }
             history.append("\(step). \(decision.action)\(coords) → \(result)｜\(decision.thought ?? "")")
         }
         let average = aiCalls > 0 ? String(format: " / AI平均 %.1f秒・%d tok／手", aiSeconds / Double(aiCalls), totalTokens / aiCalls) : ""
-        add("終了: \(step)手\(average) / API報告トークン合計 \(totalTokens)（取得できた分）")
+        add("終了: \(step)手（うちAIなし \(textTaps)手）\(average) / API報告トークン合計 \(totalTokens)（取得できた分）")
         phaseText = "終了"
     }
 }

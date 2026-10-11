@@ -60,6 +60,8 @@ struct ProbeView: View {
     @AppStorage("observeName") private var targetName = ""
     @AppStorage("geminiModel") private var model = "gemini-3.5-flash-lite"
     @AppStorage("imageDetail") private var imageDetail = ImageDetail.medium.rawValue
+    @AppStorage("notifyHistory") private var notifyHistory = true
+    @AppStorage("quickText") private var quickText = true
     @AppStorage("agentInstruction") private var instruction = ""
     @AppStorage("agentMaxSteps") private var maxSteps = 20
     @AppStorage("agentInterval") private var interval = 6.0
@@ -207,9 +209,15 @@ struct ProbeView: View {
                     Text("\(instruction.count)文字 · 自動保存")
                         .font(.caption).foregroundStyle(.secondary)
                     Toggle("実際に操作する（OFF=見て考えるだけ）", isOn: $execute)
+                    Toggle("「」で囲んだボタンはAIなしで押す", isOn: $quickText)
+                    Text("指示に「出撃」を押す、のように書くと、iPhoneが画面の文字を読んで直接押します（速い・トークン0）。見つからないときだけAIに聞きます。購入・ガチャ・設定などの言葉は対象外です。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Toggle("AIとのやり取りを通知センターに残す", isOn: $notifyHistory)
+                    Text("バナーは出さず、通知センターとロック画面に1手ずつ残します（操作中の画面は隠しません）。")
+                        .font(.caption).foregroundStyle(.secondary)
                     Stepper("最大 \(maxSteps) 手", value: $maxSteps, in: 1...200)
                     Stepper("AIに聞く間隔 \(Int(interval)) 秒以上", value: $interval, in: 2...60, step: 1)
-                    Text("検証用：同じ付近へのタップは3回まで。4回目の前に停止して位置を確認します。")
+                    Text("安全装置：同じ場所を押しても画面が変わらない状態が3回続くと停止します。")
                         .font(.caption).foregroundStyle(.secondary)
                     Button(agent.active || running ? "エージェント実行中…" : "エージェント開始") { startAgent() }
                         .disabled(agent.active || running || !hasPairing || !hasKey || target.isEmpty || instruction.isEmpty)
@@ -527,6 +535,8 @@ struct ProbeView: View {
         if keepAlive {
             audioNote = SilentAudio.shared.start() ? "無音オーディオ再生中" : "無音オーディオを開始できません"
         }
+        agent.notifyHistory = notifyHistory
+        agent.quickText = quickText
         agent.start(instruction: instruction, brain: GeminiBrain(apiKey: key, model: model,
                                                     detail: ImageDetail(rawValue: imageDetail) ?? .medium),
                     maxSteps: maxSteps, interval: interval, execute: execute)

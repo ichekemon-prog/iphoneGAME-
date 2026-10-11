@@ -86,6 +86,10 @@ enum AgentResponse {
     static func generationConfig(model: String, detail: ImageDetail, thinking: Bool) -> [String: Any] {
         var config = generationConfig
         config["mediaResolution"] = detail.apiValue
+        // One JSON line is ~100 tokens. The cap stops a runaway answer (repeating text until timeout).
+        config["maxOutputTokens"] = 512
+        // Gemini 3 is built for temperature 1.0; lower values make it loop and repeat itself.
+        if isGemini3(model) { config.removeValue(forKey: "temperature") }
         if thinking, let level = thinkingLevel(for: model) {
             config["thinkingConfig"] = ["thinkingLevel": level]
         }
@@ -94,9 +98,13 @@ enum AgentResponse {
 
     /// Gemini 3 models take thinkingLevel; Flash-Lite allows MINIMAL, Flash starts at LOW.
     /// Other models get no thinking setting (sending one to them is an error).
+    static func isGemini3(_ model: String) -> Bool {
+        model.lowercased().trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("gemini-3")
+    }
+
     static func thinkingLevel(for model: String) -> String? {
         let name = model.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        guard name.hasPrefix("gemini-3") else { return nil }
+        guard isGemini3(name) else { return nil }
         return name.contains("lite") ? "MINIMAL" : "LOW"
     }
 
@@ -159,5 +167,98 @@ enum AgentResponse {
         default: throw failure("未対応のaction")
         }
         return (decision, tokens)
+    }
+}
+
+// MARK: - Text on screen (pure logic; the iPhone's text reader fills TextBox)
+
+/// One piece of text read from the screen. Coordinates use the agent's 0...1000 space (center of the box).
+struct TextBox: Equatable {
+    let text: String
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+}
+
+/// Fixed buttons are pressed by their text without asking the AI: the user writes them in 「」 in the instruction.
+enum ScreenText {
+    /// Never pressed without the AI, even when quoted (purchases, account and settings changes).
+    static let forbidden = ["購入", "課金", "ガチャ", "オーブ", "支払", "決済", "削除", "ログアウト", "設定", "引き継", "回復", "アイテム", "ショップ", "送信"]
+    /// A line with one of these is a prohibition, not a step.
+    static let negative = ["押さない", "押すな", "タップしない", "選ばない", "触らない", "禁止", "使わない", "しない"]
+    /// Words that mark a line as "press this".
+    static let pressVerbs = ["押", "タップ", "選", "開"]
+
+    /// Quoted words of the "press" lines, in the order written.
+    static func quickWords(in instruction: String) -> [String] {
+        var words: [String] = []
+        for line in instruction.split(whereSeparator: \.isNewline).map(String.init) {
+            guard pressVerbs.contains(where: { line.contains($0) }),
+                  !negative.contains(where: { line.contains($0) }) else { continue }
+            var rest = Substring(line)
+            while let open = rest.firstIndex(of: "「"), let close = rest[open...].firstIndex(of: "」") {
+                let word = String(rest[rest.index(after: open)..<close]).trimmingCharacters(in: .whitespaces)
+                rest = rest[rest.index(after: close)...]
+                let key = normalize(word)
+                guard (1...12).contains(key.count), !forbidden.contains(where: { key.contains($0) }),
+                      !words.contains(where: { normalize($0) == key }) else { continue }
+                words.append(word)
+            }
+        }
+        return words
+    }
+
+    /// Full-width letters/digits to half-width, no spaces, lower case.
+    static func normalize(_ text: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0xFF01...0xFF5E: scalars.append(Unicode.Scalar(scalar.value - 0xFEE0)!)
+            case 0x20, 0x3000, 0x09: continue
+            default: scalars.append(scalar)
+            }
+        }
+        return String(scalars).lowercased()
+    }
+
+    /// A box shows the word as a button label: the same text, or the word with a few extra marks (「出撃!」「▶ソロ」).
+    static func matches(_ box: TextBox, _ word: String) -> Bool {
+        let label = normalize(box.text), key = normalize(word)
+        guard !key.isEmpty else { return false }
+        return label == key || (label.contains(key) && label.count <= key.count + 2)
+    }
+
+    /// The word to press now, or nil to ask the AI. Prefers the step right after the last one pressed
+    /// (the order written, wrapping around for repeated runs); a word on screen several times is not pressed.
+    static func pick(words: [String], boxes: [TextBox], after last: Int?, blocked: Set<String>) -> (index: Int, box: TextBox)? {
+        guard !words.isEmpty else { return nil }
+        let start = last.map { $0 + 1 } ?? 0
+        for offset in 0..<words.count {
+            let index = (start + offset) % words.count
+            let word = words[index]
+            guard !blocked.contains(word) else { continue }
+            let hits = boxes.filter { matches($0, word) }
+            if hits.count == 1 { return (index, hits[0]) }
+        }
+        return nil
+    }
+
+    /// Short list of the readable text for the AI, so it can aim at exact positions.
+    static func describe(_ boxes: [TextBox], limit: Int = 30) -> String {
+        boxes.filter { !$0.text.isEmpty && $0.text.count <= 16 }
+            .sorted { ($0.y, $0.x) < ($1.y, $1.x) }
+            .prefix(limit)
+            .map { "\($0.text)(\(Int($0.x)),\(Int($0.y)))" }
+            .joined(separator: " ")
+    }
+
+    /// Mean difference of two small grayscale thumbnails (0...255). Below `unchanged` the screen did not move.
+    static let unchanged = 6.0
+    static func difference(_ a: [UInt8], _ b: [UInt8]) -> Double {
+        guard a.count == b.count, !a.isEmpty else { return 255 }
+        var sum = 0
+        for i in a.indices { sum += abs(Int(a[i]) - Int(b[i])) }
+        return Double(sum) / Double(a.count)
     }
 }

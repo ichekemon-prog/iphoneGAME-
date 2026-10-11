@@ -78,6 +78,18 @@ enum Notifier {
         UNUserNotificationCenter.current().add(request)
     }
 
+    /// Quiet history entry: goes to Notification Center (and the lock screen) without a banner,
+    /// so it never covers the app being operated or appears in the screen the AI reads.
+    static func postQuiet(_ title: String, _ body: String, thread: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.threadIdentifier = thread
+        content.interruptionLevel = .passive
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
     /// Reminds one day before the signature expires (replaces the previous reminder).
     static func scheduleExpiryReminder(_ date: Date?) {
         let id = "signing-expiry"
@@ -224,6 +236,6 @@ enum InstructionTemplates {
         InstructionTemplate(title: "画面の説明だけ（操作しない）", text: "今の画面に何が表示されているかを説明してください。操作はせずに完了してください。"),
         InstructionTemplate(title: "ホーム画面へ戻る", text: "このアプリのホーム画面（メイン画面）に戻ってください。戻れたら完了してください。"),
         InstructionTemplate(title: "お知らせを閉じる", text: "表示されているお知らせやポップアップを閉じて、通常の画面に戻ってください。課金や購入の画面では何も押さずに完了してください。"),
-        InstructionTemplate(title: "同じ操作の繰り返し（ひな形）", text: "【目的】ここに達成したいことを書く\n【繰り返し】終わったら最初に戻って、指定回数まで繰り返す\n【やめる条件】スタミナ不足・エラー・課金画面が出たら何も押さずに完了\n【コツ】迷ったら待つ。同じ場所を押しても進まないときは別の方法を試す"),
+        InstructionTemplate(title: "同じ操作の繰り返し（ひな形）", text: "【目的】ここに達成したいことを書く\n【手順】決まったボタンは「」で囲む（例：「クエスト」を押す → 「出撃」を押す）。囲んだボタンはAIなしで素早く押します\n【繰り返し】終わったら最初に戻って、指定回数まで繰り返す\n【やめる条件】スタミナ不足・エラー・課金画面が出たら何も押さずに完了\n【コツ】押せるボタンが見えたら迷わず押す。同じ場所を押しても進まないときは別の方法を試す"),
     ]
 }
