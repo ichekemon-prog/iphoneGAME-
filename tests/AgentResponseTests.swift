@@ -48,6 +48,20 @@ struct AgentResponseTests {
         let (_, missingUsage) = try AgentResponse.decode(noUsage)
         precondition(missingUsage == nil)
         _ = try JSONSerialization.data(withJSONObject: AgentResponse.generationConfig)
+        precondition(AgentResponse.thinkingLevel(for: "gemini-3.5-flash-lite") == "MINIMAL")
+        precondition(AgentResponse.thinkingLevel(for: "gemini-3.1-flash-lite") == "MINIMAL")
+        precondition(AgentResponse.thinkingLevel(for: "gemini-3.5-flash") == "LOW")
+        precondition(AgentResponse.thinkingLevel(for: "gemini-2.5-flash") == nil)
+        let fast = AgentResponse.generationConfig(model: "gemini-3.5-flash-lite", detail: .medium, thinking: true)
+        precondition(fast["mediaResolution"] as? String == "MEDIA_RESOLUTION_MEDIUM")
+        precondition((fast["thinkingConfig"] as? [String: Any])?["thinkingLevel"] as? String == "MINIMAL")
+        _ = try JSONSerialization.data(withJSONObject: fast)
+        let plain = AgentResponse.generationConfig(model: "gemini-3.5-flash-lite", detail: .low, thinking: false)
+        precondition(plain["thinkingConfig"] == nil && plain["mediaResolution"] as? String == "MEDIA_RESOLUTION_LOW")
+        precondition(AgentResponse.isTransient(status: 503) && !AgentResponse.isTransient(status: 429))
+        let used = AgentResponse.usage(["usageMetadata": ["promptTokenCount": 700, "candidatesTokenCount": 40,
+                                                          "thoughtsTokenCount": 12, "totalTokenCount": 752]])
+        precondition(used.prompt == 700 && used.output == 40 && used.thoughts == 12 && used.total == 752)
         print("Agent response tests passed")
     }
 }

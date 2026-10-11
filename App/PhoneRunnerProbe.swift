@@ -59,6 +59,7 @@ struct ProbeView: View {
     @AppStorage("observeBundle") private var target = ""
     @AppStorage("observeName") private var targetName = ""
     @AppStorage("geminiModel") private var model = "gemini-3.5-flash-lite"
+    @AppStorage("imageDetail") private var imageDetail = ImageDetail.medium.rawValue
     @AppStorage("agentInstruction") private var instruction = ""
     @AppStorage("agentMaxSteps") private var maxSteps = 20
     @AppStorage("agentInterval") private var interval = 6.0
@@ -241,6 +242,13 @@ struct ProbeView: View {
                         }
                     }.pickerStyle(.menu)
                     Text("無料枠はモデル・アカウントで異なります。AI Studioの上限を確認してください。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Picker("画面の読み取りの細かさ", selection: $imageDetail) {
+                        ForEach(ImageDetail.allCases, id: \.rawValue) { detail in
+                            Text(detail.label).tag(detail.rawValue)
+                        }
+                    }.pickerStyle(.menu)
+                    Text("細かさを下げるほど、1手が速く・使用量（トークン）が少なくなります。押す位置がずれるときは上げてください。")
                         .font(.caption).foregroundStyle(.secondary)
                     SecureField(hasKey ? "APIキー保存済み（変更する場合のみ入力）" : "APIキーを貼り付け", text: $keyInput)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -519,7 +527,8 @@ struct ProbeView: View {
         if keepAlive {
             audioNote = SilentAudio.shared.start() ? "無音オーディオ再生中" : "無音オーディオを開始できません"
         }
-        agent.start(instruction: instruction, brain: GeminiBrain(apiKey: key, model: model),
+        agent.start(instruction: instruction, brain: GeminiBrain(apiKey: key, model: model,
+                                                    detail: ImageDetail(rawValue: imageDetail) ?? .medium),
                     maxSteps: maxSteps, interval: interval, execute: execute)
     }
     private func endBackgroundTask() {

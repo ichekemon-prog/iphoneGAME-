@@ -42,6 +42,12 @@ enum KeyStore {
 struct GeminiBrain {
     let apiKey: String
     let model: String
+    var detail: ImageDetail = .medium
+    /// Seconds to wait for one answer. Usual answers take a few seconds; past this
+    /// the server is congested and a fresh retry is faster than waiting longer.
+    static let timeout: TimeInterval = 30
+    /// Models that rejected the thinking setting (older or renamed models).
+    nonisolated(unsafe) static var noThinking = Set<String>()
 
     static let system = """
     あなたはiPhoneを操作するAIエージェントです。毎回、iPhoneの現在の画面画像と、ユーザーの指示・これまでの行動・経験メモが与えられます。
@@ -51,7 +57,7 @@ struct GeminiBrain {
     画像全体を基準に、x=画像内の横位置/画像幅×1000、y=画像内の縦位置/画像高さ×1000で指定します。ピクセル数やiOSのポイント値をそのまま返さないでください。
     出力形式:
     {"action":"tap","x":500,"y":500,"x2":0,"y2":0,"seconds":0,"observation":"画面の状況（短く）","thought":"判断理由（短く）","memo":""}
-    actionはtap・swipe・wait・doneのいずれか1つ。x,y,x2,y2,secondsは必須で、その操作で使わない数値は0にします。説明は各1文で簡潔にしてください。
+    actionはtap・swipe・wait・doneのいずれか1つ。x,y,x2,y2,secondsは必須で、その操作で使わない数値は0にします。observationとthoughtは各20文字以内。迷わず素早く答えてください。
     - tap: x,yをタップ。ボタンや文字の中心を狙う。
     - swipe: (x,y)から(x2,y2)へスワイプ。
     - wait: 読み込み中・演出中などで待つ。secondsに秒数（1〜10）。
@@ -64,10 +70,10 @@ struct GeminiBrain {
     - WDA受理は画面が進んだ証拠ではありません。進まない場合、ボタンの背景を含む領域を見直し、実際に押せる中心を再確認してください。
     """
 
-    func decide(instruction: String, step: Int, maxSteps: Int, history: [String], memos: [String], jpeg: Data) async throws -> (Decision, Int?) {
+    func decide(instruction: String, step: Int, maxSteps: Int, history: [String], memos: [String], jpeg: Data) async throws -> (Decision, TokenUsage) {
         var text = "指示: \(instruction)\nステップ: \(step)/\(maxSteps)\n"
-        text += "直近の行動:\n" + (history.isEmpty ? "（なし）\n" : history.suffix(10).joined(separator: "\n") + "\n")
-        text += "経験メモ:\n" + (memos.isEmpty ? "（なし）\n" : memos.suffix(30).map { "- \($0)" }.joined(separator: "\n") + "\n")
+        text += "直近の行動:\n" + (history.isEmpty ? "（なし）\n" : history.suffix(6).joined(separator: "\n") + "\n")
+        text += "経験メモ:\n" + (memos.isEmpty ? "（なし）\n" : memos.suffix(20).map { "- \($0)" }.joined(separator: "\n") + "\n")
         text += "今の画面を見て、次の1手をJSONで答えてください。"
 
         let body: [String: Any] = [
@@ -79,27 +85,47 @@ struct GeminiBrain {
                     ["inline_data": ["mime_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
                 ],
             ]],
-            "generationConfig": AgentResponse.generationConfig,
+            "generationConfig": AgentResponse.generationConfig(
+                model: model, detail: detail, thinking: !Self.noThinking.contains(model)),
         ]
         let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(trimmed):generateContent") else {
             throw BrainError.format("モデル名")
         }
-        var request = URLRequest(url: url, timeoutInterval: 60)
+        var request = URLRequest(url: url, timeoutInterval: Self.timeout)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError {
+            switch error.code {
+            case .timedOut: throw BrainError.transient("\(Int(Self.timeout))秒以内に応答なし")
+            case .networkConnectionLost, .notConnectedToInternet, .cannotConnectToHost, .dnsLookupFailed:
+                throw BrainError.transient("通信できません（\(error.code.rawValue)）")
+            default: throw error
+            }
+        }
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         if code == 429 { throw BrainError.rateLimited }
         guard code == 200, let json else {
             let message = ((json?["error"] as? [String: Any])?["message"] as? String) ?? "-"
+            if AgentResponse.isTransient(status: code) { throw BrainError.transient("HTTP \(code) 混雑") }
+            // A model that does not take the thinking setting: drop it and ask again once.
+            if code == 400, message.lowercased().contains("thinking"), !Self.noThinking.contains(model) {
+                Self.noThinking.insert(model)
+                return try await decide(instruction: instruction, step: step, maxSteps: maxSteps,
+                                        history: history, memos: memos, jpeg: jpeg)
+            }
             throw BrainError.http(code, String(message.prefix(160)))
         }
-        return try AgentResponse.decode(json)
+        let (decision, _) = try AgentResponse.decode(json)
+        return (decision, AgentResponse.usage(json))
     }
 }
 
@@ -205,6 +231,9 @@ final class AgentRunner: ObservableObject {
         var repeatedTaps = 0
         var rateLimitRetries = 0
         var consecutiveFailures = 0
+        var transientRetries = 0
+        var aiSeconds = 0.0
+        var aiCalls = 0
 
         while step < maxSteps && !stopRequested && agent_ready() {
             if probeInFront {
@@ -236,11 +265,31 @@ final class AgentRunner: ObservableObject {
             phaseText = "\(step)手目: AIが判断中"
             lastCall = Date()
             let decision: Decision
+            var cost = ""
             do {
-                let (d, tokens) = try await brain.decide(instruction: instruction, step: step, maxSteps: maxSteps,
-                                                        history: history, memos: memos, jpeg: jpeg)
+                let started = Date()
+                let (d, usage) = try await brain.decide(instruction: instruction, step: step, maxSteps: maxSteps,
+                                                       history: history, memos: memos, jpeg: jpeg)
                 decision = d
-                totalTokens += tokens ?? 0
+                let seconds = Date().timeIntervalSince(started)
+                aiSeconds += seconds
+                aiCalls += 1
+                totalTokens += usage.total
+                cost = String(format: "［AI %.1f秒・%d tok", seconds, usage.total)
+                    + (usage.thoughts > 0 ? "（思考\(usage.thoughts)）］" : "］")
+                transientRetries = 0
+            } catch let BrainError.transient(reason) {
+                // Busy server or no reply: not the model's mistake. Retry with a fresh screen.
+                transientRetries += 1
+                if transientRetries > 5 {
+                    add("AIの混雑・無応答が続くため停止しました（\(reason)）。時間をおくか、別のモデルを選んでください")
+                    break
+                }
+                let wait = min(20.0, 3.0 * pow(2.0, Double(transientRetries - 1)))
+                add("\(step)手目: \(reason)。\(Int(wait))秒後に再試行（\(transientRetries)/5）")
+                step -= 1
+                await pause(wait)
+                continue
             } catch BrainError.rateLimited {
                 rateLimitRetries += 1
                 if rateLimitRetries > 2 { add("利用上限が続くため停止しました。モデルと利用枠を確認してください"); break }
@@ -283,7 +332,7 @@ final class AgentRunner: ObservableObject {
                 default: return ""
                 }
             }()
-            add("\(step)手目 \(decision.action)\(coords)\n  見: \(decision.observation ?? "-")\n  考: \(decision.thought ?? "-")")
+            add("\(step)手目 \(decision.action)\(coords) \(cost)\n  見: \(decision.observation ?? "-")\n  考: \(decision.thought ?? "-")")
             if decision.action == "tap", let x = decision.x, let y = decision.y {
                 let size = CGSize(width: CGFloat(pixels.width), height: CGFloat(pixels.height))
                 let format = UIGraphicsImageRendererFormat()
@@ -349,7 +398,8 @@ final class AgentRunner: ObservableObject {
             if result.hasPrefix("error") { add("操作エラーのため停止しました"); break }
             history.append("\(step). \(decision.action)\(coords) → \(result)｜\(decision.thought ?? "")")
         }
-        add("終了: \(step)手 / API報告トークン合計 \(totalTokens)（取得できた分・形式不正を含む）")
+        let average = aiCalls > 0 ? String(format: " / AI平均 %.1f秒・%d tok／手", aiSeconds / Double(aiCalls), totalTokens / aiCalls) : ""
+        add("終了: \(step)手\(average) / API報告トークン合計 \(totalTokens)（取得できた分）")
         phaseText = "終了"
     }
 }

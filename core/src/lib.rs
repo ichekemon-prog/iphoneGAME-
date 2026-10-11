@@ -199,7 +199,10 @@ async fn service(t: &tunnel::Tunnel, cfg: &Config, mut rx: mpsc::UnboundedReceiv
     let mut w = wda::Wda::start(t.provider()).await?;
     let local = w.prefer_local().await;
     if let Err(e) = w
-        .settings(json!({"mjpegScalingFactor": 50, "mjpegServerFramerate": 5, "mjpegServerScreenshotQuality": 40}))
+        .settings(json!({"mjpegScalingFactor": 50, "mjpegServerFramerate": 5, "mjpegServerScreenshotQuality": 40,
+            // Rotate frames to the app's orientation, so landscape apps arrive upright and
+            // match /window/size (tap coordinates). Without it frames stay portrait.
+            "mjpegFixOrientation": true}))
         .await
     {
         status(&format!("S1: {e}（既定のまま続行）"));

@@ -12,8 +12,39 @@ struct Decision: Decodable {
     var memo: String?
 }
 
+/// How finely the screen image is read. Lower = fewer tokens and faster replies.
+enum ImageDetail: String, CaseIterable {
+    case low, medium, high
+
+    var apiValue: String {
+        switch self {
+        case .low: return "MEDIA_RESOLUTION_LOW"
+        case .medium: return "MEDIA_RESOLUTION_MEDIUM"
+        case .high: return "MEDIA_RESOLUTION_HIGH"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .low: return "低（最速・節約、細かい文字は苦手）"
+        case .medium: return "中（おすすめ）"
+        case .high: return "高（従来どおり、遅い）"
+        }
+    }
+}
+
+/// Token counts reported by the API for one call.
+struct TokenUsage {
+    var prompt = 0
+    var output = 0
+    var thoughts = 0
+    var total = 0
+}
+
 enum BrainError: LocalizedError {
     case rateLimited
+    /// Temporary: server busy (5xx) or no reply in time. Retry the same step.
+    case transient(String)
     case http(Int, String)
     case format(String)
     case response(String, Int?)
@@ -21,6 +52,7 @@ enum BrainError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .rateLimited: return "利用上限に達しました（429）"
+        case let .transient(message): return "一時的に応答なし: \(message)"
         case let .http(code, message): return "HTTP \(code): \(message)"
         case let .format(message): return "応答の形式が不正: \(message)"
         case let .response(message, tokens):
@@ -47,6 +79,37 @@ enum AgentResponse {
             "additionalProperties": false,
         ]
         return ["responseMimeType": "application/json", "responseJsonSchema": schema, "temperature": 0.2]
+    }
+
+    /// Per-call settings: smaller image tokens and the least thinking the model allows.
+    /// Choosing a tap on a screen needs little reasoning; long thinking only adds seconds.
+    static func generationConfig(model: String, detail: ImageDetail, thinking: Bool) -> [String: Any] {
+        var config = generationConfig
+        config["mediaResolution"] = detail.apiValue
+        if thinking, let level = thinkingLevel(for: model) {
+            config["thinkingConfig"] = ["thinkingLevel": level]
+        }
+        return config
+    }
+
+    /// Gemini 3 models take thinkingLevel; Flash-Lite allows MINIMAL, Flash starts at LOW.
+    /// Other models get no thinking setting (sending one to them is an error).
+    static func thinkingLevel(for model: String) -> String? {
+        let name = model.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard name.hasPrefix("gemini-3") else { return nil }
+        return name.contains("lite") ? "MINIMAL" : "LOW"
+    }
+
+    /// 5xx answers are temporary overloads; 429 is handled separately as a quota limit.
+    static func isTransient(status: Int) -> Bool {
+        (500...599).contains(status)
+    }
+
+    static func usage(_ json: [String: Any]) -> TokenUsage {
+        let meta = json["usageMetadata"] as? [String: Any] ?? [:]
+        func value(_ key: String) -> Int { meta[key] as? Int ?? 0 }
+        return TokenUsage(prompt: value("promptTokenCount"), output: value("candidatesTokenCount"),
+                          thoughts: value("thoughtsTokenCount"), total: value("totalTokenCount"))
     }
 
     static func decode(_ json: [String: Any]) throws -> (Decision, Int?) {

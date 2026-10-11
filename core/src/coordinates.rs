@@ -16,7 +16,12 @@ pub fn check_image(width: f64, height: f64, size: (f64, f64)) -> Result<(), Stri
         return Err("画像または画面サイズが不正です".into());
     }
     if ((width / height) / (size.0 / size.1) - 1.0).abs() > 0.03 {
-        return Err("判断画像と現在の画面の縦横比が違います。回転・画像範囲を確認してください".into());
+        let swapped = ((width / height) / (size.1 / size.0) - 1.0).abs() <= 0.03;
+        return Err(if swapped {
+            "画面の向き（縦・横）が判断画像と違います。画面が回転した直後なら、次の手で自動的に合います".into()
+        } else {
+            "判断画像と現在の画面の縦横比が違います。回転・画像範囲を確認してください".into()
+        });
     }
     Ok(())
 }
